@@ -1,0 +1,806 @@
+A seguir apresento uma visão geral (conceitual e prática) de como você pode conduzir um projeto de previsão (forecast) de uma série temporal mensal de “POUPANÇA” usando diversos modelos (ARIMA, SARIMAX, ElasticNet, Modelos de Árvore, Prophet e LSTM). A ideia é mostrar um passo a passo, com ênfase na **modularização**, **testes de múltiplos modelos** e **boa engenharia de código**. Também será enfatizado o uso de **Time Series Cross Validation** e **otimização da métrica MAPE**.
+
+---
+
+## 1. Visão Geral do Fluxo de Trabalho
+
+1. **Coleta e Limpeza dos Dados**  
+   - Carregar o dataset contendo as colunas:  
+     - `DATA` (somente o primeiro dia de cada mês, ex: 2020-01-01, 2020-02-01, ...),  
+     - `POUPANCA` (valor numérico),  
+     - `IPCA_ACUMULADO_12M` (percentual do IPCA acumulado 12M),  
+     - `SELIC_ANO` (percentual da taxa Selic ao ano),  
+     - `CAMBIO_PTAX` (taxa de câmbio real/dólar).
+   - Converter a coluna de data para formato de data do Pandas (`datetime`).
+   - Garantir a ordenação dos dados no tempo.
+
+2. **Análise Exploratória (EDA)**  
+   - Visualizar a série de `POUPANCA` ao longo do tempo.  
+   - Plotar as variáveis macroeconômicas (`IPCA_ACUMULADO_12M`, `SELIC_ANO`, `CAMBIO_PTAX`) e observar correlações.
+
+3. **Divisão Treino/Teste e Criação de “Série Futura”**  
+   - Decidir quantos meses ficarão no **conjunto de teste** (por exemplo, 6 ou 12 meses finais).  
+   - Separar `df_treino` e `df_teste`.
+
+4. **Preparação e Engenharia de Atributos**  
+   - (Opcional) Realizar transformações como `StandardScaler` ou `MinMaxScaler`.  
+   - Criar defasagens (lags) e/ou janelas de rolling se apropriado.  
+   - Organizar como “exogenous features” (variáveis exógenas) para uso em alguns modelos (como SARIMAX).
+
+5. **Configuração de Validação Cruzada em Série Temporal**  
+   - Usar `TimeSeriesSplit` (ou abordagem similar) para garantir que a validação respeite a ordem temporal.
+
+6. **Modelagem**  
+   - **ARIMA / SARIMAX** (via `statsmodels` ou `pmdarima`)  
+   - **ElasticNet** (via `sklearn`)  
+   - **Modelos baseados em Árvores** (e.g. `RandomForestRegressor` ou `XGBRegressor`)  
+   - **Prophet** (do Facebook/Meta)  
+   - **LSTM** (usando Keras/TensorFlow)
+
+7. **Escolha da Métrica**  
+   - Calcular o **MAPE** para cada modelo na validação cruzada, escolher o melhor conjunto de hiperparâmetros e, por fim, avaliar no conjunto de teste.
+
+8. **Forecast FInal**  
+   - Usar o melhor modelo (ou ensemble) para prever `POUPANCA` nos meses futuros.
+
+---
+
+## 2. Estrutura Modular do Código
+
+Abaixo está um **exemplo** de como estruturar o projeto em Python de forma modular, usando pipelines (quando aplicável), escalonamento, testes de múltiplos modelos e validação cruzada para séries temporais. Os passos são demonstrados em **seções** separadas, mas podem ser integrados em notebooks, scripts ou pacotes.
+
+### 2.1. Imports Principais
+
+```python
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Modelos e ferramentas
+from sklearn.linear_model import ElasticNet
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+# Para ARIMA / SARIMAX
+import statsmodels.api as sm
+from pmdarima import auto_arima
+
+# Para validação e métricas
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import StandardScaler
+
+# Prophet
+from prophet import Prophet
+
+# Keras (para LSTM)
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+# Ignorar warnings de versões
+import warnings
+warnings.filterwarnings('ignore')
+```
+
+---
+
+### 2.2. Leitura e Preparação dos Dados
+
+```python
+# Exemplo fictício de carregamento do CSV
+df = pd.read_csv('dados_poupanca.csv', parse_dates=['DATA'])
+
+# Ordenar por data, caso não esteja ordenado
+df.sort_values('DATA', inplace=True)
+
+# Exemplo de seleção das colunas de interesse
+# Supondo que o DataFrame original tenha essas colunas exatas:
+# ['DATA', 'POUPANCA', 'IPCA_ACUMULADO_12M', 'SELIC_ANO', 'CAMBIO_PTAX']
+
+# Verificar possíveis valores nulos ou inconsistências
+df.dropna(subset=['POUPANCA'], inplace=True)
+
+df.head()
+```
+
+**Observação**: Se a ideia for deixar a solução “genérica” para outras variáveis-alvo (LCA, LCI, etc.), você pode criar um parâmetro `target_col` que, no exemplo, seria `POUPANCA`.
+
+---
+
+### 2.3. Criação de Funções Auxiliares
+
+#### 2.3.1. Função para calcular MAPE
+
+```python
+def mean_absolute_percentage_error_custom(y_true, y_pred):
+    """
+    Calcula MAPE de forma customizada, evitando divisão por zero.
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+```
+
+*(O `sklearn.metrics.mean_absolute_percentage_error` também está disponível. Pode usar diretamente.)*
+
+#### 2.3.2. Função de Criação de “Folds” para Validação Cruzada
+
+Para séries temporais, não podemos embaralhar os dados. Uma abordagem comum:
+
+```python
+def time_series_cross_validation_score(
+    model, X, y, time_splits=3, scale=False, scaler=None, verbose=False):
+    """
+    Aplica uma validação cruzada em série temporal, retornando a média do MAPE.
+    """
+    tscv = TimeSeriesSplit(n_splits=time_splits)
+    errors = []
+    
+    for train_index, val_index in tscv.split(X):
+        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+        
+        # Escalamento, se for o caso
+        if scale:
+            if scaler is None:
+                scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_val = scaler.transform(X_val)
+        
+        # Treinar
+        model.fit(X_train, y_train)
+        # Prever
+        y_pred = model.predict(X_val)
+        # Calcular erro
+        mape = mean_absolute_percentage_error_custom(y_val, y_pred)
+        errors.append(mape)
+        
+        if verbose:
+            print(f"Fold MAPE: {mape:.4f}")
+            
+    return np.mean(errors)
+```
+
+---
+
+### 2.4. Separando Treino/Teste
+
+Decida quantos meses usar para teste (por exemplo, 12 meses finais).
+
+```python
+# Exemplo:
+test_size = 12
+df_train = df.iloc[:-test_size]
+df_test = df.iloc[-test_size:]
+
+# Definir X e y
+target_col = 'POUPANCA'  # ou outra variável de interesse
+features = ['IPCA_ACUMULADO_12M', 'SELIC_ANO', 'CAMBIO_PTAX']
+
+X_train = df_train[features]
+y_train = df_train[target_col]
+
+X_test = df_test[features]
+y_test = df_test[target_col]
+```
+
+---
+
+### 2.5. Modelos Clássicos de Séries Temporais
+
+#### 2.5.1. ARIMA (sem variáveis exógenas)
+
+Para usar ARIMA (univariado), podemos usar `pmdarima.auto_arima`:
+
+```python
+# Exemplo ARIMA univariado
+arima_model = auto_arima(
+    y=df_train[target_col], 
+    seasonal=False, 
+    trace=True,
+    error_action='ignore',
+    suppress_warnings=True
+)
+arima_model.summary()
+
+# Previsão no conjunto de teste
+forecast_arima = arima_model.predict(n_periods=len(df_test))
+mape_arima = mean_absolute_percentage_error_custom(df_test[target_col], forecast_arima)
+print(f"MAPE ARIMA: {mape_arima:.2f}%")
+```
+
+#### 2.5.2. SARIMAX (com variáveis exógenas)
+
+Usamos `statsmodels.tsa.statespace.SARIMAX` ou o próprio `auto_arima` com `exogenous=X`:
+
+```python
+# Exemplo usando pmdarima
+sarimax_model = auto_arima(
+    y=df_train[target_col],
+    exogenous=df_train[features],
+    seasonal=True,
+    m=12,  # mensal
+    trace=True,
+    error_action='ignore',
+    suppress_warnings=True
+)
+
+# Previsão
+forecast_sarimax = sarimax_model.predict(
+    n_periods=len(df_test),
+    exogenous=df_test[features]
+)
+
+mape_sarimax = mean_absolute_percentage_error_custom(df_test[target_col], forecast_sarimax)
+print(f"MAPE SARIMAX: {mape_sarimax:.2f}%")
+```
+
+---
+
+### 2.6. Modelos de Regressão (ElasticNet, Árvores, etc.)
+
+#### 2.6.1. Exemplo com ElasticNet
+
+Aqui, trataremos a série como um problema de regressão supervisionada. Podemos incluir *lags* se quisermos, mas no exemplo abaixo estamos apenas usando variáveis macroeconômicas como features. (Vale ressaltar que lags da própria `POUPANCA` podem melhorar o modelo.)
+
+```python
+# Grid de hiperparâmetros
+param_grid_elastic = {
+    'alpha': [0.01, 0.1, 1.0, 10.0],
+    'l1_ratio': [0.1, 0.5, 0.9]
+}
+
+elastic = ElasticNet()
+
+grid_search_elastic = GridSearchCV(
+    estimator=elastic, 
+    param_grid=param_grid_elastic,
+    scoring='neg_mean_absolute_error',  # ou use make_scorer para MAPE
+    cv=TimeSeriesSplit(n_splits=3)
+)
+
+grid_search_elastic.fit(X_train, y_train)
+best_elastic = grid_search_elastic.best_estimator_
+
+# Avaliação no teste
+y_pred_elastic = best_elastic.predict(X_test)
+mape_elastic = mean_absolute_percentage_error_custom(y_test, y_pred_elastic)
+print(f"Melhor ElasticNet: {grid_search_elastic.best_params_}")
+print(f"MAPE ElasticNet: {mape_elastic:.2f}%")
+```
+
+#### 2.6.2. Modelos de Árvore (Ex: RandomForest ou XGBoost)
+
+```python
+param_grid_rf = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5, 7]
+}
+
+rf = RandomForestRegressor(random_state=42)
+
+grid_search_rf = GridSearchCV(
+    estimator=rf,
+    param_grid=param_grid_rf,
+    scoring='neg_mean_absolute_error',  # ou MAPE
+    cv=TimeSeriesSplit(n_splits=3)
+)
+
+grid_search_rf.fit(X_train, y_train)
+best_rf = grid_search_rf.best_estimator_
+
+# Avaliação no teste
+y_pred_rf = best_rf.predict(X_test)
+mape_rf = mean_absolute_percentage_error_custom(y_test, y_pred_rf)
+print(f"Melhor RandomForest: {grid_search_rf.best_params_}")
+print(f"MAPE RandomForest: {mape_rf:.2f}%")
+```
+
+Se quiser usar `XGBRegressor`, a lógica é quase idêntica:
+
+```python
+param_grid_xgb = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5, 7],
+    'learning_rate': [0.01, 0.1, 0.3]
+}
+
+xgb_reg = XGBRegressor(random_state=42)
+
+grid_search_xgb = GridSearchCV(
+    estimator=xgb_reg,
+    param_grid=param_grid_xgb,
+    scoring='neg_mean_absolute_error', # ou MAPE
+    cv=TimeSeriesSplit(n_splits=3)
+)
+
+grid_search_xgb.fit(X_train, y_train)
+best_xgb = grid_search_xgb.best_estimator_
+
+y_pred_xgb = best_xgb.predict(X_test)
+mape_xgb = mean_absolute_percentage_error_custom(y_test, y_pred_xgb)
+print(f"Melhor XGB: {grid_search_xgb.best_params_}")
+print(f"MAPE XGB: {mape_xgb:.2f}%")
+```
+
+---
+
+### 2.7. Prophet
+
+O Prophet requer um DataFrame específico com colunas `ds` (data) e `y` (target). Para variáveis exógenas, usamos `add_regressor`.
+
+```python
+# Preparar dados para Prophet
+df_prophet_train = pd.DataFrame({
+    'ds': df_train['DATA'],
+    'y' : df_train[target_col],
+    'ipca': df_train['IPCA_ACUMULADO_12M'],
+    'selic': df_train['SELIC_ANO'],
+    'cambio': df_train['CAMBIO_PTAX']
+})
+
+# Definir modelo
+model_prophet = Prophet()
+model_prophet.add_regressor('ipca')
+model_prophet.add_regressor('selic')
+model_prophet.add_regressor('cambio')
+
+model_prophet.fit(df_prophet_train)
+
+# Criação do dataframe futuro
+df_future = pd.DataFrame({
+    'ds': df_test['DATA'],
+    'ipca': df_test['IPCA_ACUMULADO_12M'],
+    'selic': df_test['SELIC_ANO'],
+    'cambio': df_test['CAMBIO_PTAX']
+})
+
+forecast_prophet = model_prophet.predict(df_future)
+
+mape_prophet = mean_absolute_percentage_error_custom(
+    df_test[target_col], 
+    forecast_prophet['yhat']
+)
+print(f"MAPE Prophet: {mape_prophet:.2f}%")
+```
+
+---
+
+### 2.8. LSTM (Keras/TensorFlow)
+
+Para usar LSTM, precisamos pensar em formato de *janelas* (sequências). Exemplo simplificado:
+
+1. Definir número de *lags* (p.ex. 12).  
+2. Reformatar dados para (samples, timesteps, features).  
+3. Construir modelo Keras LSTM.
+
+**Exemplo** (bem resumido):
+
+```python
+# Vamos supor que você crie uma função para transformar a série em formato supervisonado:
+def create_supervised_dataset(series, exog, n_lags=12):
+    """
+    Transforma dados em formato [samples, timesteps, features].
+    series: coluna target (pandas Series)
+    exog: DataFrame com variáveis exógenas
+    n_lags: quantas defasagens usar
+    
+    Retorna X, y no formato pronto para LSTM
+    """
+    X, y = [], []
+    
+    for i in range(n_lags, len(series)):
+        seq_target = series.iloc[i-n_lags:i].values
+        seq_exog = exog.iloc[i-n_lags:i].values
+        seq_features = np.column_stack([seq_target, seq_exog])  # target e exog lags
+        X.append(seq_features)
+        y.append(series.iloc[i])  # valor futuro de target
+    
+    return np.array(X), np.array(y)
+
+# Exemplo de uso:
+n_lags = 12
+X_lstm, y_lstm = create_supervised_dataset(df_train[target_col], df_train[features], n_lags=n_lags)
+print("Formato X_lstm:", X_lstm.shape)  # (samples, timesteps=12, features=1+len(features))
+
+# Separar treino/val
+# Exemplo, sem cross validation (mas ideal seria com TSCV)
+split_index = int(0.8 * len(X_lstm))
+X_train_lstm, X_val_lstm = X_lstm[:split_index], X_lstm[split_index:]
+y_train_lstm, y_val_lstm = y_lstm[:split_index], y_lstm[split_index:]
+
+# Construir e treinar o modelo LSTM
+model_lstm = Sequential()
+model_lstm.add(LSTM(64, activation='relu', input_shape=(n_lags, X_lstm.shape[2])))
+model_lstm.add(Dropout(0.2))
+model_lstm.add(Dense(1))
+
+model_lstm.compile(optimizer='adam', loss='mse')
+
+model_lstm.fit(
+    X_train_lstm, 
+    y_train_lstm, 
+    validation_data=(X_val_lstm, y_val_lstm),
+    epochs=50, 
+    batch_size=16,
+    verbose=1
+)
+
+# Depois, para prever o futuro, você precisa gerar o último "janela" para X_test
+# Este passo requer cuidado para criar as sequências corretamente para os meses de teste.
+# Exemplo (bem simplificado):
+X_test_lstm, y_test_lstm = create_supervised_dataset(df_test[target_col], df_test[features], n_lags=n_lags)
+
+y_pred_lstm = model_lstm.predict(X_test_lstm)
+
+mape_lstm = mean_absolute_percentage_error_custom(y_test_lstm, y_pred_lstm.flatten())
+print(f"MAPE LSTM: {mape_lstm:.2f}%")
+```
+
+**Observação**: A parte de LSTM exige um preparo de dados mais específico. Também podemos incluir normalização (`MinMaxScaler`) antes de criar janelas, lembrando de não “vazar” dados do futuro.
+
+---
+
+## 3. Comparação Final dos Modelos
+
+Após executar cada um dos modelos acima, teremos algo como:
+
+- `mape_arima`
+- `mape_sarimax`
+- `mape_elastic`
+- `mape_rf`
+- `mape_xgb`
+- `mape_prophet`
+- `mape_lstm`
+
+Podemos organizar os resultados em um DataFrame:
+
+```python
+results = {
+    'Modelo': [
+        'ARIMA', 'SARIMAX', 'ElasticNet', 'RandomForest', 'XGBoost', 'Prophet', 'LSTM'
+    ],
+    'MAPE': [
+        mape_arima, mape_sarimax, mape_elastic, 
+        mape_rf, mape_xgb, mape_prophet, mape_lstm
+    ]
+}
+
+df_results = pd.DataFrame(results)
+df_results.sort_values('MAPE', inplace=True)
+df_results
+```
+
+Você escolheria o modelo com **menor MAPE**.
+
+---
+
+## 4. Considerações e Boas Práticas
+
+1. **Feature Engineering**: Incluir lags da própria série de `POUPANCA` nos modelos de regressão, assim como transformações (por exemplo, diferenciar a série ou usar diferenças de log) pode melhorar muito o desempenho.
+2. **Estacionariedade**: Verificar se a série é estacionária. Se não for, considerar diferenciações (para ARIMA/SARIMAX).  
+3. **Exogenous Variables**: Para SARIMAX, Prophet e até LSTM, vale a pena testar a inclusão de variáveis exógenas que façam sentido econômico.  
+4. **Escalonamento**: Normalizar ou padronizar as variáveis geralmente ajuda modelos baseados em gradiente ou redes neurais.  
+5. **Cross Validation para Séries**: Sempre respeitar a ordem temporal. Não usar `KFold` normal.  
+6. **Hiperparâmetros**: Cada modelo tem hiperparâmetros relevantes. Ajustá-los (via `GridSearchCV` ou `RandomizedSearchCV`) pode trazer ganhos significativos.  
+7. **Complexidade vs. Interpretabilidade**: Modelos como ARIMA/SARIMAX são mais interpretáveis, enquanto LSTM e XGBoost podem capturar relações mais complexas, mas são mais “caixa-preta”.  
+8. **Objetivo de Negócio**: Sempre alinhar as métricas (MAPE) às necessidades do negócio. Por vezes, RMSE ou MAE podem ser também importantes para determinadas aplicações.
+
+---
+
+## 5. Conclusão
+
+Você viu aqui **vários caminhos** para prever a série temporal de `POUPANCA`. Cada abordagem tem vantagens e desvantagens. Em prática, é altamente recomendável:
+
+- Criar um pipeline genérico para facilmente **trocar a variável target** (ex: `POUPANCA` -> `LCA`, `LCI` etc.).  
+- Definir funções/módulos para **gerar lags**, **fazer cross validation**, **rodar grid search** e **salvar resultados**.  
+- Manter um “log” dos experimentos e comparar consistentemente as métricas (em especial o **MAPE**).  
+
+Assim, você terá um fluxo mais produtivo, escalável e confiável para *time series forecasting*.
+
+
+A seguir, apresento um código mais completo que aborda:
+
+1. **Verificação automática de estacionariedade** (usando o teste ADF - Augmented Dickey-Fuller).  
+2. **Criação de lags (Feature Engineering)** para a variável-alvo (`POUPANCA`) e para as variáveis exógenas, se desejado.  
+3. **Exemplo de treinamento de um modelo de árvore** (RandomForest ou XGBoost) que, em tese, **pode** extrapolar, mas com **fortes ressalvas** (explicação logo abaixo).
+
+> **Extrapolação em Modelos de Árvore**  
+> Em geral, **modelos baseados em árvores** (Random Forest, XGBoost, etc.) não são grandes especialistas em extrapolar para valores muito além do range observado no treino. Isso não significa que eles *nunca* consigam prever valores maiores (ou menores) — mas sim que a extrapolação pura, muito fora da faixa de treino, costuma ser falha. Se o mecanismo que gera os dados permitir uma “continuidade” e houver correlações fortes com as variáveis exógenas, eventualmente eles podem “chegar” a valores maiores. Mas isso não é garantido como em modelos lineares com tendência ou modelos ARIMA que capturam sazonalidade/tendências via parâmetros específicos.  
+
+---
+
+# 1. Imports e Setup
+
+```python
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# Teste de estacionariedade
+from statsmodels.tsa.stattools import adfuller
+
+# Ignorar warnings
+import warnings
+warnings.filterwarnings("ignore")
+```
+
+---
+
+# 2. Funções Auxiliares
+
+```python
+def adf_stationarity_test(series, alpha=0.05):
+    """
+    Executa teste ADF (Augmented Dickey-Fuller) para checar estacionariedade.
+    Retorna True se a série for estacionária (p-valor < alpha).
+    Caso contrário, retorna False.
+    """
+    result = adfuller(series.dropna(), autolag='AIC')
+    p_value = result[1]
+    is_stationary = p_value < alpha
+    return is_stationary, p_value
+
+def difference_series(series, order=1):
+    """
+    Aplica diferenciação de ordem 'order' na série.
+    Útil caso a série não seja estacionária.
+    """
+    return series.diff(periods=order).dropna()
+
+def create_lags(df, target_col, exog_cols=None, n_lags=12, drop_na=True):
+    """
+    Cria lags para a variável-alvo e, se exog_cols for informado, também cria lags para as variáveis exógenas.
+    
+    :param df: DataFrame com pelo menos as colunas target_col e exog_cols
+    :param target_col: Nome da coluna que será usada como alvo
+    :param exog_cols: Lista de colunas exógenas (default=None, cria lags só do target)
+    :param n_lags: número de lags a serem criados
+    :param drop_na: se True, descarta as linhas iniciais que contêm NaN devido a criação de lags
+    :return: DataFrame com as colunas de lags + target original
+    """
+    df_lagged = df.copy()
+    
+    # Lags do target
+    for lag in range(1, n_lags + 1):
+        df_lagged[f"{target_col}_lag_{lag}"] = df_lagged[target_col].shift(lag)
+        
+    # Lags das exógenas
+    if exog_cols is not None:
+        for col in exog_cols:
+            for lag in range(1, n_lags + 1):
+                df_lagged[f"{col}_lag_{lag}"] = df_lagged[col].shift(lag)
+                
+    if drop_na:
+        df_lagged.dropna(inplace=True)
+        
+    return df_lagged
+
+def mean_absolute_percentage_error_custom(y_true, y_pred):
+    """
+    Calcula MAPE (Mean Absolute Percentage Error).
+    Evita divisão por zero caso haja valor zero em y_true.
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+```
+
+---
+
+# 3. Exemplo de Pipeline Completo
+
+## 3.1 Leitura e Preparação
+
+```python
+# Exemplo hipotético de leitura
+df = pd.read_csv("dados_poupanca.csv", parse_dates=["DATA"])
+df.sort_values("DATA", inplace=True)
+
+# Verificar colunas
+# df.columns -> ["DATA", "POUPANCA", "IPCA_ACUMULADO_12M", "SELIC_ANO", "CAMBIO_PTAX"]
+
+# Definir target e features
+target_col = "POUPANCA"
+exog_cols = ["IPCA_ACUMULADO_12M", "SELIC_ANO", "CAMBIO_PTAX"]
+```
+
+### 3.2 Verificar Estacionariedade da Série Original (POUPANCA)
+
+```python
+# Primeiro, checar se a série (POUPANCA) é estacionária
+is_stationary, pval = adf_stationarity_test(df[target_col])
+print(f"POUPANCA é estacionária? {is_stationary}, p-valor: {pval}")
+
+# Se não for estacionária, podemos diferenciar (1a ordem, por ex.)
+if not is_stationary:
+    df["POUPANCA_DIFF"] = difference_series(df[target_col], order=1)
+    # Nova checagem
+    is_stationary_diff, pval_diff = adf_stationarity_test(df["POUPANCA_DIFF"].dropna())
+    print(f"Após 1a diferença, é estacionária? {is_stationary_diff}, p-valor: {pval_diff}")
+    
+    # Podemos seguir com a série diferenciada se quisermos
+    # Porém, para demonstrar o pipeline de lags, vou usar a série original
+    # e deixar a diferença como uma feature adicional (opcional).
+    # df["POUPANCA"] = df["POUPANCA_DIFF"]  # Substituir se quisesse usar a série diferenciada
+else:
+    print("A série já é estacionária (ou p-valor < alpha). Vamos seguir sem diferenciar.")
+```
+
+### 3.3 Criação de Lags
+
+Vamos criar 12 lags do **target** e também 3 lags das variáveis exógenas (por exemplo). Se quiser lags exógenas de 12, basta colocar `n_lags=12`.
+
+```python
+n_lags_target = 12  # numero de lags para o target
+n_lags_exog = 3     # numero de lags para exógenas (exemplo)
+
+# Primeiro criaremos lags do target
+df_lagged_target = create_lags(
+    df=df,
+    target_col=target_col,
+    exog_cols=None,  # só do target
+    n_lags=n_lags_target,
+    drop_na=False
+)
+
+# Depois criaremos lags das exógenas (opcional)
+# Para simplificar, vamos fazê-lo no mesmo df. Poderíamos fazer de uma só vez,
+# mas aqui é para demonstrar
+df_lagged_exog = create_lags(
+    df=df_lagged_target,
+    target_col=target_col,
+    exog_cols=exog_cols,
+    n_lags=n_lags_exog,
+    drop_na=True  # agora removemos de vez
+)
+
+df_lagged_exog.head()
+```
+
+Agora temos colunas como `POUPANCA_lag_1`, ..., `POUPANCA_lag_12`, e `IPCA_ACUMULADO_12M_lag_1`, etc.  
+
+### 3.4 Definir Treino e Teste
+
+```python
+# Vamos supor que reservamos 12 meses para teste
+test_size = 12
+df_train = df_lagged_exog.iloc[:-test_size]
+df_test = df_lagged_exog.iloc[-test_size:]
+
+# Nosso y agora é o valor atual de "POUPANCA" (sem lags)
+y_train = df_train[target_col]
+y_test = df_test[target_col]
+
+# As features serão os lags e as exógenas (também lagged) que criamos
+# Remover colunas originais [DATA, POUPANCA, IPCA_ACUMULADO_12M, ...] para não vazar
+cols_features = [c for c in df_train.columns 
+                 if c not in ["DATA", target_col, "POUPANCA_DIFF"] + exog_cols]
+
+X_train = df_train[cols_features]
+X_test = df_test[cols_features]
+
+print("Shape X_train:", X_train.shape)
+print("Shape X_test: ", X_test.shape)
+```
+
+### 3.5 Escalonamento (Opcional)
+
+Se quisermos usar escalonamento (e.g. `StandardScaler` ou `MinMaxScaler`), podemos fazê-lo:
+
+```python
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+```
+
+### 3.6 Modelo de Árvore (RandomForest)
+
+```python
+param_grid_rf = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5, 7]
+}
+
+rf = RandomForestRegressor(random_state=42)
+
+# Usar TimeSeriesSplit para cross validation
+tscv = TimeSeriesSplit(n_splits=3)
+
+grid_search_rf = GridSearchCV(
+    estimator=rf,
+    param_grid=param_grid_rf,
+    scoring='neg_mean_absolute_error',
+    cv=tscv,
+    n_jobs=-1
+)
+grid_search_rf.fit(X_train_scaled, y_train)
+
+best_rf = grid_search_rf.best_estimator_
+y_pred_rf = best_rf.predict(X_test_scaled)
+
+mape_rf = mean_absolute_percentage_error_custom(y_test, y_pred_rf)
+print(f"Melhor RandomForest: {grid_search_rf.best_params_}")
+print(f"MAPE RandomForest: {mape_rf:.2f}%")
+```
+
+**Comentários sobre extrapolação**:  
+- Se, no conjunto de teste, `POUPANCA` assumiu valores **maiores** do que qualquer coisa vista em treino, **o modelo de árvore pode** tentar prever valores maiores, **mas não é garantido** que conseguirá estimar bem fora do range. Ele tentará seguir a “folha” ou região do espaço de features mais próxima.  
+- Para extrapolações grandes, modelos com estrutura paramétrica de tendência (ARIMA/SARIMAX, Prophet, regressão linear com tendência etc.) costumam se sair melhor.
+
+### 3.7 Modelo de Árvore (XGBoost)
+
+Caso queira outro modelo de árvore:
+
+```python
+param_grid_xgb = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5, 7],
+    'learning_rate': [0.01, 0.1]
+}
+
+xgb_reg = XGBRegressor(random_state=42)
+
+grid_search_xgb = GridSearchCV(
+    estimator=xgb_reg,
+    param_grid=param_grid_xgb,
+    scoring='neg_mean_absolute_error',
+    cv=tscv,
+    n_jobs=-1
+)
+
+grid_search_xgb.fit(X_train_scaled, y_train)
+best_xgb = grid_search_xgb.best_estimator_
+
+y_pred_xgb = best_xgb.predict(X_test_scaled)
+mape_xgb = mean_absolute_percentage_error_custom(y_test, y_pred_xgb)
+print(f"Melhor XGB: {grid_search_xgb.best_params_}")
+print(f"MAPE XGB: {mape_xgb:.2f}%")
+```
+
+---
+
+# 4. Conclusões Principais
+
+1. **Extrapolação em Modelos de Árvore**: Não é o ponto forte dessas arquiteturas, pois elas se baseiam em “dividir” o espaço das features de acordo com valores vistos em treino. Se a série `POUPANCA` no teste alcançar níveis não vistos (muito acima ou muito abaixo), a precisão pode cair.
+
+2. **Verificação de Estacionariedade**: Inserimos o **teste ADF** no pipeline.  
+   - Se **não** for estacionária, você pode:
+     - Diferenciar a série (1ª ou mais ordens).  
+     - Aplicar transformações de log, etc.  
+   - Em alguns casos, *mesmo não sendo estacionária*, modelos de árvore conseguem capturar tendências e sazonalidades desde que haja volume de dados suficiente e features representativas (lags).  
+
+3. **Criação de Lags**:  
+   - Criar lags **do target** e, possivelmente, das variáveis exógenas ajuda os modelos de regressão/árvore a aprender padrões temporais.  
+   - Escolher quantas defasagens (e.g., 3, 6, 12) depende da sazonalidade do negócio. Para dados mensais, 12 lags cobre 1 ano.  
+
+4. **Uso de Pipelines**:  
+   - Acima, demonstrei de forma “manual” (criando lags e escalonando antes do GridSearch). Em produção, você pode encapsular tudo em um `Pipeline` do `sklearn`, mas a lógica é a mesma.  
+
+5. **Cross Validation com TimeSeriesSplit**:  
+   - Evita vazamento temporal e replica o cenário de previsão futura.  
+
+6. **MAPE**:  
+   - Mantemos o uso do MAPE personalizado para medir o percentual de erro.  
+
+Em suma, esse pipeline **mais completo** faz:
+- Leitura e ordenação dos dados.  
+- Verifica (automaticamente) estacionariedade com ADF.  
+- Aplica (se necessário) diferenciação (ou, no exemplo, só checamos).  
+- Cria lags do target e das exógenas.  
+- Separa Treino/Teste.  
+- Faz escalonamento.  
+- Treina um modelo de árvore (RandomForest / XGBoost) com Cross Validation em série temporal.  
+- Avalia o modelo usando MAPE.  
+
+> **Dica Final**: Se a extrapolação for **crítica** para o projeto (por exemplo, prever valores muito acima do histórico), você pode combinar modelos lineares (que extrapolam melhor) ou Prophet/SARIMAX (que modelam tendência/sazonalidade) com os de árvore, e então fazer um *ensemble* ou escolher o melhor método.
