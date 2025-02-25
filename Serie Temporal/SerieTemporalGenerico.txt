@@ -1,0 +1,224 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.linear_model import ElasticNet
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_error
+import itertools
+from joblib import Parallel, delayed
+import pickle
+import os
+
+# Configurações gerais
+target_col = 'target'
+test_size = 0.2
+n_jobs = -1
+results_dir = 'model_results'
+os.makedirs(results_dir, exist_ok=True)
+
+# Dicionário de configurações dos modelos
+models_config = {
+    'SARIMAX': {
+        'params': {
+            'order': [(1,0,0), (2,0,0)],
+            'seasonal_order': [(0,0,0,0)],
+            'exog_lags': [1, 2],
+            'exog_vars': itertools.combinations(['var1', 'var2', 'var3'], 2)
+        },
+        'create_model': lambda params: SARIMAX(
+            endog=None,
+            exog=None,
+            order=params['order'],
+            seasonal_order=params['seasonal_order'],
+            enforce_stationarity=False
+        )
+    },
+    'LightGBM': {
+        'params': {
+            'num_leaves': [31, 63],
+            'learning_rate': [0.01, 0.1],
+            'endog_lags': [3, 5],
+            'exog_lags': [1, 2],
+            'exog_vars': itertools.combinations(['var1', 'var2', 'var3'], 2)
+        },
+        'create_model': lambda params: LGBMRegressor(
+            num_leaves=params['num_leaves'],
+            learning_rate=params['learning_rate']
+        )
+    },
+    'ElasticNet': {
+        'params': {
+            'alpha': [0.1, 1.0],
+            'l1_ratio': [0.5, 0.8],
+            'endog_lags': [3, 5],
+            'exog_lags': [1, 2],
+            'exog_vars': itertools.combinations(['var1', 'var2', 'var3'], 2)
+        },
+        'create_model': lambda params: ElasticNet(
+            alpha=params['alpha'],
+            l1_ratio=params['l1_ratio']
+        )
+    }
+}
+
+# Função para criar features temporais
+def create_features(endog, exog, endog_lags, exog_lags, exog_vars):
+    dfs = []
+    
+    # Lags da variável endógena
+    for lag in range(1, endog_lags + 1):
+        dfs.append(endog.shift(lag).rename(f'endog_lag_{lag}'))
+    
+    # Lags das variáveis exógenas
+    for var in exog_vars:
+        for lag in range(0, exog_lags + 1):
+            dfs.append(exog[var].shift(lag).rename(f'{var}_lag_{lag}'))
+    
+    return pd.concat(dfs, axis=1).dropna()
+
+# Função para criar lags exógenos (SARIMAX)
+def create_exog_lags(exog_df, lags, selected_vars):
+    return pd.concat(
+        [exog_df[selected_vars].shift(i) for i in range(lags + 1)],
+        axis=1,
+        keys=[f'lag_{i}' for i in range(lags + 1)]
+    ).dropna()
+
+# Função genérica de avaliação
+def evaluate_model(model_name, params, endog, exog, test_size):
+    try:
+        # Criar features
+        if model_name == 'SARIMAX':
+            exog_lagged = create_exog_lags(exog, params['exog_lags'], params['exog_vars'])
+            aligned_endog = endog.loc[exog_lagged.index]
+            X = exog_lagged
+            y = aligned_endog
+        else:
+            features = create_features(endog, exog, params['endog_lags'], 
+                                     params['exog_lags'], params['exog_vars'])
+            X = features
+            y = endog.loc[features.index]
+        
+        # Split temporal
+        split_idx = int(len(y) * (1 - test_size))
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
+        
+        # Treinar modelo
+        model = models_config[model_name]['create_model'](params)
+        
+        if model_name == 'SARIMAX':
+            model = model.fit(y_train, exog=X_train, disp=False)
+            preds = model.get_forecast(steps=len(y_test), exog=X_test).predicted_mean
+        else:
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+        
+        mae = mean_absolute_error(y_test, preds)
+        return {
+            'model_name': model_name,
+            'params': params,
+            'mae': mae,
+            'model': model,
+            'success': True
+        }
+    
+    except Exception as e:
+        return {
+            'model_name': model_name,
+            'params': params,
+            'error': str(e),
+            'success': False
+        }
+
+# Gerar todos os parâmetros
+def generate_all_parameters():
+    all_params = []
+    for model_name, config in models_config.items():
+        params_grid = config['params']
+        keys, values = zip(*params_grid.items())
+        for combination in itertools.product(*values):
+            params = dict(zip(keys, combination))
+            all_params.append((model_name, params))
+    return all_params
+
+# Executar busca
+all_params = generate_all_parameters()
+results = Parallel(n_jobs=n_jobs)(
+    delayed(evaluate_model)(model_name, params, endog, exog, test_size)
+    for model_name, params in all_params
+)
+
+# Processar resultados
+best_models = {}
+for result in results:
+    if not result['success']:
+        continue
+    
+    model_name = result['model_name']
+    mae = result['mae']
+    
+    # Verificar se é o melhor modelo para esta categoria
+    if model_name not in best_models or mae < best_models[model_name]['Menor MAE']:
+        best_models[model_name] = {
+            'nome': model_name,
+            'Menor MAE': mae,
+            'Melhores parametros': {
+                'hiperparametros': {k: v for k, v in result['params'].items() 
+                                  if k not in ['exog_lags', 'endog_lags', 'exog_vars']},
+                'lags': result['params'].get('exog_lags', result['params'].get('endog_lags')),
+                'exogenas': list(result['params'].get('exog_vars', []))
+            },
+            'model': result['model']
+        }
+
+# Salvar resultados
+for model_name, model_info in best_models.items():
+    filename = os.path.join(results_dir, f'best_{model_name}.pkl')
+    with open(filename, 'wb') as f:
+        pickle.dump(model_info, f)
+
+# Identificar o melhor modelo global
+best_overall = min(best_models.values(), key=lambda x: x['Menor MAE'])
+print(f"Melhor modelo geral: {best_overall['nome']}")
+print(f"MAE: {best_overall['Menor MAE']:.4f}")
+print("Parâmetros:", best_overall['Melhores parametros'])
+
+# Função para retreinar o melhor modelo com todos os dados
+def retrain_best_model(best_model_info, endog, exog):
+    params = best_model_info['Melhores parametros']
+    model_name = best_model_info['nome']
+    
+    if model_name == 'SARIMAX':
+        exog_lagged = create_exog_lags(exog, params['lags'], params['exogenas'])
+        aligned_endog = endog.loc[exog_lagged.index]
+        model = SARIMAX(
+            aligned_endog,
+            exog=exog_lagged,
+            order=params['hiperparametros']['order'],
+            seasonal_order=params['hiperparametros'].get('seasonal_order', (0,0,0,0)),
+            enforce_stationarity=False
+        )
+        return model.fit(disp=False)
+    
+    else:
+        features = create_features(
+            endog, exog,
+            endog_lags=params['lags'],
+            exog_lags=params['lags'],
+            exog_vars=params['exogenas']
+        )
+        X = features
+        y = endog.loc[features.index]
+        
+        model = models_config[model_name]['create_model'](params['hiperparametros'])
+        return model.fit(X, y)
+
+# Retreinar o melhor modelo
+final_model = retrain_best_model(best_overall, endog, exog)
+
+# Salvar modelo final
+with open(os.path.join(results_dir, 'final_model.pkl'), 'wb') as f:
+    pickle.dump(final_model, f)
+
+print("Modelo final treinado e salvo com sucesso!")
