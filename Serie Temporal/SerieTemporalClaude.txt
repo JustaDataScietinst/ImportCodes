@@ -1,0 +1,564 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import joblib
+import os
+from itertools import combinations, product
+from functools import partial
+import warnings
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import ElasticNet
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import ParameterGrid
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import xgboost as xgb
+import lightgbm as lgb
+from multiprocessing import Pool, cpu_count
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+# Constantes
+CAMINHO_ARQUIVO = './dados_credito_rural.csv'
+TARGET = 'VOLUME_CREDITO'
+DATA_INICIO_TREINO = '2014-01-01'
+DATA_FIM_TREINO = '2022-12-31'
+DATA_INICIO_TESTE = '2023-01-01'
+DATA_FIM_TESTE = '2023-12-31'
+DATA_INICIO_FORECAST = '2024-01-01'
+DATA_FIM_FORECAST = '2024-12-31'
+
+# Parâmetros para geração de features e treinamento
+MAX_LAG = 12
+N_JOBS = max(1, cpu_count() - 1)
+
+# Lista de possíveis features preditoras (excluindo a target)
+POSSIVEIS_FEATURES = [
+    'SELIC', 'IGP_M', 'IPCA', 'CAMBIO', 'PIB_AGRO', 
+    'PRECO_SOJA', 'PRECO_MILHO', 'PRECO_CAFE', 'PRECO_BOI',
+    'PLUVIOSIDADE', 'TEMPERATURA_MEDIA'
+]
+
+# Definição de hiperparâmetros para cada modelo
+PARAMS_LIGHTGBM = {
+    'n_estimators': [100, 200, 500],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'max_depth': [3, 5, 7],
+    'num_leaves': [31, 63, 127],
+    'reg_alpha': [0, 0.1, 0.5],
+    'reg_lambda': [0, 0.1, 0.5]
+}
+
+PARAMS_XGBOOST = {
+    'n_estimators': [100, 200, 500],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'max_depth': [3, 5, 7],
+    'min_child_weight': [1, 3, 5],
+    'gamma': [0, 0.1, 0.3],
+    'subsample': [0.7, 0.8, 0.9]
+}
+
+PARAMS_ELASTICNET = {
+    'alpha': [0.001, 0.01, 0.1, 1.0],
+    'l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9],
+    'max_iter': [1000, 5000],
+    'tol': [1e-4, 1e-5]
+}
+
+# SARIMAX: (p, d, q), (P, D, Q, s)
+PARAMS_SARIMAX = {
+    'order': [(1, 0, 0), (1, 0, 1), (1, 1, 1), (2, 1, 0), (2, 1, 2), (0, 1, 1)],
+    'seasonal_order': [(0, 0, 0, 0), (1, 0, 0, 12), (0, 1, 1, 12), (1, 1, 1, 12)]
+}
+
+def ler_dados(caminho_arquivo):
+    try:
+        df = pd.read_csv(caminho_arquivo)
+        if 'DATA' in df.columns:
+            df['DATA'] = pd.to_datetime(df['DATA'])
+            df.set_index('DATA', inplace=True)
+        elif 'Date' in df.columns:
+            df['DATA'] = pd.to_datetime(df['Date'])
+            df.set_index('DATA', inplace=True)
+            df.drop('Date', axis=1, errors='ignore', inplace=True)
+        else:
+            for col in df.columns:
+                if df[col].dtype == 'object' and pd.to_datetime(df[col], errors='coerce').notna().all():
+                    df['DATA'] = pd.to_datetime(df[col])
+                    df.set_index('DATA', inplace=True)
+                    df.drop(col, axis=1, errors='ignore', inplace=True)
+                    break
+        
+        df = df.sort_index()
+        return df
+    except Exception as e:
+        logger.error(f"Erro ao ler o arquivo {caminho_arquivo}: {str(e)}")
+        raise
+
+def criar_lags(df, colunas, max_lag):
+    df_com_lags = df.copy()
+    
+    for col in colunas:
+        if col in df.columns:
+            for lag in range(1, max_lag + 1):
+                df_com_lags[f'{col}_LAG_{lag}'] = df[col].shift(lag)
+    
+    return df_com_lags
+
+def criar_medias_moveis(df, colunas, janelas=[3, 6, 12]):
+    df_com_ma = df.copy()
+    
+    for col in colunas:
+        if col in df.columns:
+            for janela in janelas:
+                df_com_ma[f'{col}_MA_{janela}'] = df[col].rolling(window=janela).mean()
+    
+    return df_com_ma
+
+def criar_features_sazonais(df):
+    df_sazonal = df.copy()
+    df_sazonal['MES'] = df.index.month
+    df_sazonal['TRIMESTRE'] = df.index.quarter
+    
+    mes_dummies = pd.get_dummies(df_sazonal['MES'], prefix='MES', drop_first=True)
+    trimestre_dummies = pd.get_dummies(df_sazonal['TRIMESTRE'], prefix='TRIMESTRE', drop_first=True)
+    
+    df_sazonal = pd.concat([df_sazonal, mes_dummies, trimestre_dummies], axis=1)
+    df_sazonal.drop(['MES', 'TRIMESTRE'], axis=1, inplace=True)
+    
+    return df_sazonal
+
+def selecionar_combinacoes_features(df, features_possiveis, target, min_features=1, max_features=None):
+    features_existentes = [f for f in features_possiveis if f in df.columns]
+    max_features = len(features_existentes) if max_features is None else min(max_features, len(features_existentes))
+    
+    combinacoes = []
+    for i in range(min_features, max_features + 1):
+        for combo in combinations(features_existentes, i):
+            combinacoes.append(list(combo))
+    
+    return combinacoes
+
+def preparar_dados_treino_teste(df, target, features, data_inicio_treino, data_fim_treino, 
+                                data_inicio_teste, data_fim_teste):
+    # Filtrar dados de treino e teste
+    df_treino = df.loc[data_inicio_treino:data_fim_treino].copy()
+    df_teste = df.loc[data_inicio_teste:data_fim_teste].copy()
+    
+    # Remover linhas com valores NaN
+    df_treino = df_treino.dropna()
+    
+    # Preparar X e y para treino
+    X_treino = df_treino[features]
+    y_treino = df_treino[target]
+    
+    # Preparar X e y para teste
+    X_teste = df_teste[features]
+    y_teste = df_teste[target]
+    
+    return X_treino, y_treino, X_teste, y_teste
+
+def normalizar_dados(X_treino, X_teste):
+    scaler = StandardScaler()
+    X_treino_scaled = scaler.fit_transform(X_treino)
+    X_teste_scaled = scaler.transform(X_teste)
+    
+    # Convertendo de volta para DataFrame para manter os nomes das colunas
+    X_treino_scaled_df = pd.DataFrame(X_treino_scaled, index=X_treino.index, columns=X_treino.columns)
+    X_teste_scaled_df = pd.DataFrame(X_teste_scaled, index=X_teste.index, columns=X_teste.columns)
+    
+    return X_treino_scaled_df, X_teste_scaled_df, scaler
+
+def treinar_elasticnet(X_treino, y_treino, X_teste, y_teste, params):
+    modelo = ElasticNet(**params, random_state=42)
+    modelo.fit(X_treino, y_treino)
+    
+    y_pred = modelo.predict(X_teste)
+    
+    metricas = calcular_metricas(y_teste, y_pred)
+    return modelo, metricas
+
+def treinar_xgboost(X_treino, y_treino, X_teste, y_teste, params):
+    modelo = xgb.XGBRegressor(**params, random_state=42)
+    modelo.fit(X_treino, y_treino)
+    
+    y_pred = modelo.predict(X_teste)
+    
+    metricas = calcular_metricas(y_teste, y_pred)
+    return modelo, metricas
+
+def treinar_lightgbm(X_treino, y_treino, X_teste, y_teste, params):
+    modelo = lgb.LGBMRegressor(**params, random_state=42)
+    modelo.fit(X_treino, y_treino)
+    
+    y_pred = modelo.predict(X_teste)
+    
+    metricas = calcular_metricas(y_teste, y_pred)
+    return modelo, metricas
+
+def treinar_sarimax(df_treino, df_teste, target, params):
+    try:
+        modelo = SARIMAX(df_treino[target], 
+                        order=params['order'],
+                        seasonal_order=params['seasonal_order'],
+                        enforce_stationarity=False,
+                        enforce_invertibility=False)
+        
+        resultado = modelo.fit(disp=False)
+        
+        # Prever para o período de teste
+        previsao = resultado.get_forecast(steps=len(df_teste))
+        y_pred = previsao.predicted_mean
+        
+        # Ajustar o índice das previsões para coincidir com df_teste
+        y_pred.index = df_teste.index
+        
+        metricas = calcular_metricas(df_teste[target], y_pred)
+        return resultado, metricas
+    except Exception as e:
+        logger.warning(f"Erro ao treinar SARIMAX com parâmetros {params}: {str(e)}")
+        return None, {'rmse': float('inf'), 'mae': float('inf'), 'r2': -float('inf')}
+
+def calcular_metricas(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    return {'rmse': rmse, 'mae': mae, 'r2': r2}
+
+def executar_grid_search_model(modelo_func, param_grid, X_treino, y_treino, X_teste, y_teste):
+    resultados = []
+    
+    for params in ParameterGrid(param_grid):
+        try:
+            modelo, metricas = modelo_func(X_treino, y_treino, X_teste, y_teste, params)
+            
+            resultados.append({
+                'params': params,
+                'metricas': metricas,
+                'modelo': modelo
+            })
+            
+            logger.info(f"Modelo treinado com parâmetros: {params}, RMSE: {metricas['rmse']:.4f}")
+        except Exception as e:
+            logger.warning(f"Erro ao treinar modelo com parâmetros {params}: {str(e)}")
+    
+    return resultados
+
+def executar_grid_search_sarimax(param_grid, df_treino, df_teste, target):
+    resultados = []
+    
+    for params in ParameterGrid(param_grid):
+        try:
+            modelo, metricas = treinar_sarimax(df_treino, df_teste, target, params)
+            
+            if modelo is not None:
+                resultados.append({
+                    'params': params,
+                    'metricas': metricas,
+                    'modelo': modelo
+                })
+                
+                logger.info(f"SARIMAX treinado com parâmetros: {params}, RMSE: {metricas['rmse']:.4f}")
+        except Exception as e:
+            logger.warning(f"Erro ao treinar SARIMAX com parâmetros {params}: {str(e)}")
+    
+    return resultados
+
+def processar_combinacao(args):
+    features, df, target, data_inicio_treino, data_fim_treino, data_inicio_teste, data_fim_teste = args
+    
+    try:
+        logger.info(f"Processando combinação com {len(features)} features")
+        
+        # Preparar dados de treino e teste
+        X_treino, y_treino, X_teste, y_teste = preparar_dados_treino_teste(
+            df, target, features, data_inicio_treino, data_fim_treino, data_inicio_teste, data_fim_teste
+        )
+        
+        # Normalizar dados para modelos que precisam
+        X_treino_norm, X_teste_norm, _ = normalizar_dados(X_treino, X_teste)
+        
+        # Treinar modelos
+        resultados_elasticnet = executar_grid_search_model(
+            treinar_elasticnet, PARAMS_ELASTICNET, X_treino_norm, y_treino, X_teste_norm, y_teste
+        )
+        
+        resultados_xgboost = executar_grid_search_model(
+            treinar_xgboost, PARAMS_XGBOOST, X_treino, y_treino, X_teste, y_teste
+        )
+        
+        resultados_lightgbm = executar_grid_search_model(
+            treinar_lightgbm, PARAMS_LIGHTGBM, X_treino, y_treino, X_teste, y_teste
+        )
+        
+        df_treino_sarimax = pd.DataFrame(y_treino)
+        df_teste_sarimax = pd.DataFrame(y_teste)
+        
+        resultados_sarimax = executar_grid_search_sarimax(
+            PARAMS_SARIMAX, df_treino_sarimax, df_teste_sarimax, target
+        )
+        
+        return {
+            'features': features,
+            'elasticnet': resultados_elasticnet,
+            'xgboost': resultados_xgboost,
+            'lightgbm': resultados_lightgbm,
+            'sarimax': resultados_sarimax
+        }
+    except Exception as e:
+        logger.error(f"Erro ao processar combinação {features}: {str(e)}")
+        return None
+
+def encontrar_melhores_modelos(resultados_combinacoes):
+    melhores_modelos = {
+        'elasticnet': {'rmse': float('inf'), 'modelo': None, 'params': None, 'features': None},
+        'xgboost': {'rmse': float('inf'), 'modelo': None, 'params': None, 'features': None},
+        'lightgbm': {'rmse': float('inf'), 'modelo': None, 'params': None, 'features': None},
+        'sarimax': {'rmse': float('inf'), 'modelo': None, 'params': None, 'features': None}
+    }
+    
+    for resultado in resultados_combinacoes:
+        if resultado is None:
+            continue
+            
+        features = resultado['features']
+        
+        for modelo_tipo in ['elasticnet', 'xgboost', 'lightgbm', 'sarimax']:
+            for res in resultado[modelo_tipo]:
+                rmse = res['metricas']['rmse']
+                if rmse < melhores_modelos[modelo_tipo]['rmse']:
+                    melhores_modelos[modelo_tipo] = {
+                        'rmse': rmse,
+                        'mae': res['metricas']['mae'],
+                        'r2': res['metricas']['r2'],
+                        'modelo': res['modelo'],
+                        'params': res['params'],
+                        'features': features
+                    }
+    
+    # Encontrar o melhor modelo geral
+    melhor_geral = min(melhores_modelos.items(), key=lambda x: x[1]['rmse'])
+    melhores_modelos['melhor_geral'] = {
+        'tipo': melhor_geral[0],
+        **melhor_geral[1]
+    }
+    
+    return melhores_modelos
+
+def fazer_forecast(melhor_modelo, df, target, features, data_inicio_forecast, data_fim_forecast, scaler=None):
+    df_forecast = df.loc[data_inicio_forecast:data_fim_forecast].copy()
+    
+    # Para SARIMAX, usar a função get_forecast
+    if isinstance(melhor_modelo['modelo'], SARIMAX):
+        # Índices do período de forecast
+        indices_forecast = pd.date_range(start=data_inicio_forecast, end=data_fim_forecast, freq='MS')
+        
+        # Fazer forecast
+        previsao = melhor_modelo['modelo'].get_forecast(steps=len(indices_forecast))
+        forecast_values = previsao.predicted_mean
+        intervalo_confianca = previsao.conf_int()
+        
+        # Criar dataframe com resultados
+        forecast_df = pd.DataFrame({
+            'previsao': forecast_values,
+            'limite_inferior': intervalo_confianca.iloc[:, 0],
+            'limite_superior': intervalo_confianca.iloc[:, 1]
+        }, index=indices_forecast)
+        
+    else:  # Para modelos baseados em features (ElasticNet, XGBoost, LightGBM)
+        # Preparar features para o período de forecast
+        X_forecast = df_forecast[features].copy()
+        
+        # Normalizar dados se necessário (ElasticNet)
+        if scaler is not None:
+            X_forecast_norm = pd.DataFrame(
+                scaler.transform(X_forecast),
+                index=X_forecast.index,
+                columns=X_forecast.columns
+            )
+            forecast_values = melhor_modelo['modelo'].predict(X_forecast_norm)
+        else:
+            forecast_values = melhor_modelo['modelo'].predict(X_forecast)
+        
+        # Criar dataframe com resultados
+        forecast_df = pd.DataFrame({
+            'previsao': forecast_values
+        }, index=X_forecast.index)
+    
+    return forecast_df
+
+def visualizar_resultados(df, target, melhores_modelos, forecast_df, data_inicio_treino, data_fim_teste, data_inicio_forecast, data_fim_forecast):
+    # Configurar estilo do gráfico
+    plt.style.use('seaborn-v0_8-darkgrid')
+    plt.figure(figsize=(15, 8))
+    
+    # Plotar dados históricos
+    plt.plot(df.loc[data_inicio_treino:data_fim_teste, target], label='Dados Históricos', color='blue')
+    
+    # Plotar forecast
+    plt.plot(forecast_df['previsao'], label='Previsão', color='red', linestyle='--')
+    
+    # Adicionar intervalo de confiança se disponível
+    if 'limite_inferior' in forecast_df.columns:
+        plt.fill_between(
+            forecast_df.index,
+            forecast_df['limite_inferior'],
+            forecast_df['limite_superior'],
+            color='red',
+            alpha=0.2,
+            label='Intervalo de Confiança (95%)'
+        )
+    
+    # Adicionar detalhes ao gráfico
+    melhor_tipo = melhores_modelos['melhor_geral']['tipo']
+    rmse = melhores_modelos['melhor_geral']['rmse']
+    
+    plt.title(f'Previsão de {target} - Modelo: {melhor_tipo.upper()} (RMSE: {rmse:.2f})')
+    plt.xlabel('Data')
+    plt.ylabel(target)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    
+    # Salvar o gráfico
+    plt.savefig(f'forecast_{target}_{melhor_tipo}.png')
+    plt.close()
+    
+    # Exibir tabela de resultados
+    resumo_modelos = pd.DataFrame({
+        'Modelo': ['ElasticNet', 'XGBoost', 'LightGBM', 'SARIMAX'],
+        'RMSE': [melhores_modelos['elasticnet']['rmse'], 
+                melhores_modelos['xgboost']['rmse'], 
+                melhores_modelos['lightgbm']['rmse'], 
+                melhores_modelos['sarimax']['rmse']],
+        'MAE': [melhores_modelos['elasticnet']['mae'], 
+               melhores_modelos['xgboost']['mae'], 
+               melhores_modelos['lightgbm']['mae'], 
+               melhores_modelos['sarimax']['mae']],
+        'R²': [melhores_modelos['elasticnet']['r2'], 
+              melhores_modelos['xgboost']['r2'], 
+              melhores_modelos['lightgbm']['r2'], 
+              melhores_modelos['sarimax']['r2']]
+    })
+    
+    resumo_modelos = resumo_modelos.sort_values('RMSE')
+    print("\nComparação dos Melhores Modelos:")
+    print(resumo_modelos)
+    
+    # Exibir detalhes do melhor modelo
+    melhor_modelo = melhores_modelos['melhor_geral']
+    print(f"\nDetalhes do Melhor Modelo ({melhor_modelo['tipo'].upper()}):")
+    print(f"RMSE: {melhor_modelo['rmse']:.4f}")
+    print(f"MAE: {melhor_modelo['mae']:.4f}")
+    print(f"R²: {melhor_modelo['r2']:.4f}")
+    print(f"Parâmetros: {melhor_modelo['params']}")
+    print(f"Features utilizadas ({len(melhor_modelo['features'])}):")
+    for f in melhor_modelo['features']:
+        print(f"- {f}")
+
+def salvar_modelos(melhores_modelos, diretorio='modelos_salvos'):
+    os.makedirs(diretorio, exist_ok=True)
+    
+    for tipo_modelo, info in melhores_modelos.items():
+        if tipo_modelo == 'melhor_geral':
+            continue
+            
+        if info['modelo'] is not None:
+            caminho = os.path.join(diretorio, f'{tipo_modelo}_modelo.joblib')
+            joblib.dump(info['modelo'], caminho)
+            
+            # Salvar metadados
+            metadados = {
+                'tipo': tipo_modelo,
+                'rmse': info['rmse'],
+                'mae': info['mae'],
+                'r2': info['r2'],
+                'params': info['params'],
+                'features': info['features']
+            }
+            
+            caminho_metadados = os.path.join(diretorio, f'{tipo_modelo}_metadados.joblib')
+            joblib.dump(metadados, caminho_metadados)
+            
+    # Salvar informações do melhor modelo
+    melhor = melhores_modelos['melhor_geral']
+    caminho_melhor = os.path.join(diretorio, 'melhor_modelo_info.joblib')
+    joblib.dump(melhor, caminho_melhor)
+    
+    logger.info(f"Modelos salvos no diretório: {diretorio}")
+
+def main():
+    logger.info("Iniciando análise de previsão de crédito rural")
+    
+    # Carregar dados
+    df = ler_dados(CAMINHO_ARQUIVO)
+    logger.info(f"Dados carregados com sucesso. Shape: {df.shape}")
+    
+    # Criar features adicionais
+    df = criar_lags(df, [TARGET] + POSSIVEIS_FEATURES, MAX_LAG)
+    df = criar_medias_moveis(df, [TARGET] + POSSIVEIS_FEATURES)
+    df = criar_features_sazonais(df)
+    logger.info(f"Features adicionais criadas. Novas dimensões: {df.shape}")
+    
+    # Selecionar combinações de features para testar
+    colunas_disponiveis = [col for col in df.columns if col != TARGET]
+    combinacoes_features = selecionar_combinacoes_features(df, colunas_disponiveis, TARGET, min_features=3, max_features=7)
+    logger.info(f"Geradas {len(combinacoes_features)} combinações de features para testar")
+    
+    # Limitar o número de combinações se for muito grande
+    max_combinacoes = 50  # Ajuste conforme necessário
+    if len(combinacoes_features) > max_combinacoes:
+        logger.info(f"Limitando para {max_combinacoes} combinações aleatórias")
+        np.random.seed(42)
+        indices = np.random.choice(len(combinacoes_features), max_combinacoes, replace=False)
+        combinacoes_features = [combinacoes_features[i] for i in indices]
+    
+    # Preparar argumentos para processamento paralelo
+    args_list = [(features, df, TARGET, DATA_INICIO_TREINO, DATA_FIM_TREINO, 
+                 DATA_INICIO_TESTE, DATA_FIM_TESTE) for features in combinacoes_features]
+    
+    # Executar grid search em paralelo
+    logger.info(f"Iniciando processamento paralelo com {N_JOBS} workers")
+    with Pool(N_JOBS) as pool:
+        resultados_combinacoes = pool.map(processar_combinacao, args_list)
+    
+    # Encontrar os melhores modelos
+    melhores_modelos = encontrar_melhores_modelos(resultados_combinacoes)
+    logger.info("Melhores modelos encontrados")
+    
+    # Normalizar dados para o melhor modelo se for ElasticNet
+    melhor_geral = melhores_modelos['melhor_geral']
+    scaler = None
+    if melhor_geral['tipo'] == 'elasticnet':
+        _, _, scaler = normalizar_dados(
+            df.loc[DATA_INICIO_TREINO:DATA_FIM_TREINO, melhor_geral['features']],
+            df.loc[DATA_INICIO_FORECAST:DATA_FIM_FORECAST, melhor_geral['features']]
+        )
+    
+    # Fazer forecast com o melhor modelo
+    forecast_df = fazer_forecast(
+        melhor_geral, df, TARGET, melhor_geral['features'],
+        DATA_INICIO_FORECAST, DATA_FIM_FORECAST, scaler
+    )
+    logger.info("Forecast realizado com o melhor modelo")
+    
+    # Visualizar resultados
+    visualizar_resultados(
+        df, TARGET, melhores_modelos, forecast_df,
+        DATA_INICIO_TREINO, DATA_FIM_TESTE,
+        DATA_INICIO_FORECAST, DATA_FIM_FORECAST
+    )
+    
+    # Salvar modelos
+    salvar_modelos(melhores_modelos)
+    
+    logger.info("Análise concluída com sucesso!")
+    return melhores_modelos, forecast_df
+
+if __name__ == "__main__":
+    melhores_modelos, forecast_df = main()
