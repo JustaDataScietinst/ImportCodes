@@ -1,0 +1,52 @@
+import pandas as pd
+
+# Função para gerar os meses de uma safra (julho do ano inicial a junho do ano seguinte)
+def gerar_meses_safra(safra):
+    ano_inicial = int(safra.split('/')[0])
+    meses = [f"{ano}{mes:02d}" for ano in [ano_inicial] for mes in range(7, 13)] + \
+            [f"{ano}{mes:02d}" for ano in [ano_inicial + 1] for mes in range(1, 7)]
+    return meses
+
+# Carregar sua base (ajuste o caminho/nome do arquivo)
+df = pd.read_csv("sua_base.csv")  # ou pd.read_excel(), dependendo do formato
+
+# Garantir que NUM_ANO_MES seja string no formato correto
+df['NUM_ANO_MES'] = df['NUM_ANO_MES'].astype(str)
+
+# Lista de safras
+safras = [f"{ano}/{ano+1}" for ano in range(2014, 2025)]
+
+# Criar todas as combinações possíveis de categorias
+combinacoes = df[['TIPO_PESSOA', 'TIPO_FINALIDADE', 'PROGRAMA', 'CENTRAL']].drop_duplicates()
+
+# Criar o esqueleto com todas as safras, meses e combinações
+esqueleto = []
+for safra in safras:
+    meses = gerar_meses_safra(safra)
+    for _, row in combinacoes.iterrows():
+        for mes in meses:
+            esqueleto.append({
+                'SAFRA': safra,
+                'NUM_ANO_MES': mes,
+                'TIPO_PESSOA': row['TIPO_PESSOA'],
+                'TIPO_FINALIDADE': row['TIPO_FINALIDADE'],
+                'PROGRAMA': row['PROGRAMA'],
+                'CENTRAL': row['CENTRAL']
+            })
+
+# Converter o esqueleto em DataFrame
+df_esqueleto = pd.DataFrame(esqueleto)
+
+# Juntar com a base original
+df_completa = df_esqueleto.merge(
+    df[['SAFRA', 'NUM_ANO_MES', 'TIPO_PESSOA', 'TIPO_FINALIDADE', 'PROGRAMA', 'CENTRAL', 'Valor_Liberado']],
+    on=['SAFRA', 'NUM_ANO_MES', 'TIPO_PESSOA', 'TIPO_FINALIDADE', 'PROGRAMA', 'CENTRAL'],
+    how='left'
+)
+
+# Preencher valores ausentes com 0
+df_completa['Valor_Liberado'] = df_completa['Valor_Liberado'].fillna(0)
+
+# Verificar o resultado
+print(df_completa.head())
+print(f"Total de linhas: {len(df_completa)}")
