@@ -1,0 +1,132 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit, KFold
+from sklearn.impute import SimpleImputer
+from lightgbm import LGBMRegressor
+from sklearn.base import BaseEstimator, TransformerMixin
+from scipy.stats import trim_mean
+
+class LagTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, n_lags):
+        self.n_lags = n_lags
+    
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        X_copy = X.copy()
+        for col in X_copy.columns:
+            for lag in range(1, self.n_lags + 1):
+                X_copy[f'{col}_lag{lag}'] = X_copy[col].shift(lag)
+        return X_copy
+
+class TrimmedMeanImputer(BaseEstimator, TransformerMixin):
+    def __init__(self, proportiontocut=0.1):
+        self.proportiontocut = proportiontocut
+        self.means_ = {}
+    
+    def fit(self, X, y=None):
+        for col in X.columns:
+            self.means_[col] = trim_mean(X[col].dropna(), proportiontocut=self.proportiontocut)
+        return self
+    
+    def transform(self, X):
+        X_copy = X.copy()
+        for col in X_copy.columns:
+            X_copy[col] = X_copy[col].fillna(self.means_.get(col, X_copy[col].mean()))
+        return X_copy
+
+class InteractionTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, top_n=5):
+        self.top_n = top_n
+    
+    def fit(self, X, y):
+        correlations = X.corrwith(y).abs().sort_values(ascending=False)
+        self.top_features = correlations.head(self.top_n).index
+        return self
+    
+    def transform(self, X):
+        X_copy = X.copy()
+        for i, feat1 in enumerate(self.top_features):
+            for feat2 in self.top_features[i+1:]:
+                X_copy[f'{feat1}_x_{feat2}'] = X_copy[feat1] * X_copy[feat2]
+        return X_copy
+
+def feature_selection_pipeline(df, target, n_lags, is_timeseries=True, n_random_features=5, top_n_interactions=5):
+    """
+    Realiza feature selection com interações e comparação com variáveis aleatórias.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        Dataframe de entrada
+    target : str
+        Nome da coluna alvo
+    n_lags : int
+        Número de lags a serem criados
+    is_timeseries : bool
+        Indica se deve usar TimeSeriesSplit
+    n_random_features : int
+        Número de variáveis aleatórias
+    top_n_interactions : int
+        Número de features para interações
+    
+    Returns:
+    --------
+    list
+        Lista de features selecionadas
+    """
+    df_copy = df.copy()
+    
+    for i in range(n_random_features):
+        df_copy[f'random_feature_{i}'] = np.random.normal(0, 1, size=len(df_copy))
+    
+    categorical_cols = df_copy.select_dtypes(include=['object', 'category']).columns
+    numeric_cols = df_copy.select_dtypes(include=['int64', 'float64']).columns.drop([target], errors='ignore')
+    
+    X = df_copy.drop(columns=[target])
+    y = df_copy[target]
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('cat', OneHotEncoder(drop='first', sparse=False, handle_unknown='ignore'), categorical_cols),
+            ('num', Pipeline([
+                ('imputer', TrimmedMeanImputer(proportiontocut=0.1)),
+                ('passthrough', 'passthrough')
+            ]), numeric_cols)
+        ])
+    
+    pipeline = Pipeline([
+        ('lag', LagTransformer(n_lags=n_lags)),
+        ('interactions', InteractionTransformer(top_n=top_n_interactions)),
+        ('preprocessor', preprocessor),
+        ('model', LGBMRegressor(random_state=42))
+    ])
+    
+    cv = TimeSeriesSplit(n_splits=5) if is_timeseries else KFold(n_splits=5, shuffle=True, random_state=42)
+    
+    all_importances = []
+    for train_idx, test_idx in cv.split(X):
+        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+        pipeline.fit(X_train, y_train)
+        importances = pipeline.named_steps['model'].feature_importances_
+        all_importances.append(importances)
+    
+    mean_importances = np.mean(all_importances, axis=0)
+    feature_names = pipeline.named_steps['preprocessor'].get_feature_names_out()
+    
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': mean_importances
+    })
+    
+    random_importances = importance_df[importance_df['feature'].str.contains('random_feature')]['importance']
+    random_threshold = np.percentile(random_importances, 75) # Percentil 75
+    
+    selected_features = importance_df[importance_df['importance'] > random_threshold]['feature'].tolist()
+    clean_features = [f.split('__')[-1] for f in selected_features]
+    
+    return clean_features
