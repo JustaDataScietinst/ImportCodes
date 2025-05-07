@@ -1,0 +1,186 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor # ou RandomForestClassifier para problemas de classificação
+from sklearn.model_selection import TimeSeriesSplit
+
+# --- 0. Simulação de Dados ---
+# Suponha que seu DataFrame 'df_original' já exista.
+# E que 'target_column' seja o nome da sua variável alvo.
+np.random.seed(42) # Para reprodutibilidade
+n_samples = 200
+data = {
+    'feature_A': np.random.rand(n_samples) * 10,
+    'feature_B': np.random.randn(n_samples) * 5,
+    'feature_C': np.random.randint(0, 100, n_samples),
+    'target_column': np.random.rand(n_samples) * 20 # Sua variável alvo
+}
+df_original = pd.DataFrame(data)
+
+# Identificar features e o alvo
+target_variable_name = 'target_column'
+feature_names_original = [col for col in df_original.columns if col != target_variable_name]
+
+# --- 1. Criar Lags de 2 Períodos ---
+df_with_lags = df_original.copy()
+n_lags = 2
+
+for col in feature_names_original + [target_variable_name]: # Incluir lags do target também pode ser útil
+    for i in range(1, n_lags + 1):
+        df_with_lags[f'{col}_lag{i}'] = df_with_lags[col].shift(i)
+
+# Remover linhas com NaNs gerados pelos lags
+df_processed = df_with_lags.dropna().reset_index(drop=True)
+
+# Separar features (X) e alvo (y)
+y = df_processed[target_variable_name]
+X = df_processed.drop(columns=[target_variable_name])
+
+# Atualizar lista de nomes de features após lags (excluindo lags do target de X, se não desejado como feature)
+current_feature_names = [col for col in X.columns if not col.startswith(f"{target_variable_name}_lag")]
+X = X[current_feature_names] # Garantir que X só tenha features
+
+print("DataFrame com Lags (primeiras linhas de X):")
+print(X.head())
+print(f"\nShape de X: {X.shape}, Shape de y: {y.shape}")
+
+# --- 2. Acrescentar 5 Variáveis Aleatórias ---
+n_random_features = 5
+random_feature_names_list = []
+for i in range(n_random_features):
+    random_col_name = f'random_feat_{i+1}'
+    X[random_col_name] = np.random.rand(len(X))
+    random_feature_names_list.append(random_col_name)
+
+print(f"\nFeatures aleatórias adicionadas: {random_feature_names_list}")
+print("X com features aleatórias (últimas colunas):")
+print(X.iloc[:, -n_random_features:].head())
+
+all_features_in_X = X.columns.tolist()
+
+# --- 3. Treinar RandomForest com TimeSeriesSplit ---
+n_splits_cv = 4
+tscv = TimeSeriesSplit(n_splits=n_splits_cv)
+
+# Usar Regressor se o target for contínuo, Classificador se for categórico
+model_rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+
+fold_feature_importances = []
+
+if len(X) < n_splits_cv + 1 : # Checagem básica para garantir amostras suficientes
+     raise ValueError(f"Não há amostras suficientes ({len(X)}) para {n_splits_cv} splits. Reduza n_splits_cv ou aumente os dados.")
+
+
+for fold_num, (train_index, test_index) in enumerate(tscv.split(X)):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+    print(f"\nFold {fold_num + 1}:")
+    print(f"  Train: index {train_index[0]} - {train_index[-1]}, shape {X_train.shape}")
+    print(f"  Test:  index {test_index[0]} - {test_index[-1]}, shape {X_test.shape}")
+
+    if X_train.empty or X_test.empty:
+        print(f"  AVISO: Conjunto de treino ou teste vazio no fold {fold_num + 1}. Pulando este fold.")
+        continue
+
+    model_rf.fit(X_train, y_train)
+    importances = model_rf.feature_importances_
+    fold_feature_importances.append(importances)
+
+# Calcular a média das importâncias através dos folds
+if not fold_feature_importances:
+    raise Exception("Nenhum fold foi treinado. Verifique os dados e os parâmetros do TimeSeriesSplit.")
+
+mean_importances_across_folds = np.mean(fold_feature_importances, axis=0)
+feature_importance_summary = pd.DataFrame({
+    'Feature': all_features_in_X,
+    'Mean_Importance': mean_importances_across_folds
+}).sort_values(by='Mean_Importance', ascending=False)
+
+print("\nImportância Média das Features (todos os folds):")
+print(feature_importance_summary)
+
+# --- 4. Média de Feature Importance das Variáveis Aleatórias ---
+random_features_importances = feature_importance_summary[
+    feature_importance_summary['Feature'].isin(random_feature_names_list)
+]
+threshold_importance = random_features_importances['Mean_Importance'].mean()
+
+print(f"\nImportância das features aleatórias:")
+print(random_features_importances)
+print(f"\nLimiar de Importância (Média das Aleatórias): {threshold_importance:.6f}")
+
+# --- 5. Analisar e Eliminar Variáveis ---
+features_to_eliminate = set()
+features_to_potentially_keep = set(feature_names_original) # Começamos com todas as originais
+
+print("\nAnalisando features para eliminação:")
+for original_feat_name in feature_names_original:
+    # Coletar a feature original (se existir em X, pois pode ter sido removida se era o target e não criamos lags dela em X)
+    # e seus lags
+    group_feature_names = []
+    if original_feat_name in X.columns: # Feature original (tempo t=0)
+        group_feature_names.append(original_feat_name)
+
+    for i in range(1, n_lags + 1):
+        lag_name = f'{original_feat_name}_lag{i}'
+        if lag_name in X.columns:
+            group_feature_names.append(lag_name)
+
+    if not group_feature_names:
+        print(f"  - Grupo para '{original_feat_name}' está vazio (feature ou lags não encontrados em X). Removendo dos 'potencialmente mantidos'.")
+        if original_feat_name in features_to_potentially_keep:
+            features_to_potentially_keep.remove(original_feat_name)
+        continue
+
+    # Obter as importâncias médias para este grupo
+    importances_of_group = feature_importance_summary[
+        feature_importance_summary['Feature'].isin(group_feature_names)
+    ]
+
+    print(f"\n  Avaliando grupo da feature original '{original_feat_name}':")
+    print(importances_of_group)
+
+    # Verificar se TODAS as features do grupo (original e seus lags) têm importância menor que o limiar
+    if not importances_of_group.empty and (importances_of_group['Mean_Importance'] < threshold_importance).all():
+        print(f"    -> ELIMINAR '{original_feat_name}' e seus lags. Todas as importâncias do grupo ({importances_of_group['Mean_Importance'].values}) são < {threshold_importance:.6f}")
+        features_to_eliminate.add(original_feat_name)
+        if original_feat_name in features_to_potentially_keep:
+            features_to_potentially_keep.remove(original_feat_name)
+    elif importances_of_group.empty:
+         print(f"    -> AVISO: Nenhuma importância encontrada para o grupo '{original_feat_name}'. Pode já ter sido removida ou não existia.")
+         if original_feat_name in features_to_potentially_keep:
+            features_to_potentially_keep.remove(original_feat_name)
+    else:
+        print(f"    -> MANTER '{original_feat_name}'. Pelo menos uma feature no grupo tem importância >= {threshold_importance:.6f}")
+
+
+print(f"\nFeatures Originais a Serem Eliminadas: {features_to_eliminate}")
+print(f"Features Originais a Serem Mantidas: {features_to_potentially_keep}")
+
+# Construir o DataFrame final com as features selecionadas
+final_selected_feature_columns = []
+for kept_orig_feat in features_to_potentially_keep:
+    if kept_orig_feat in X.columns: # Adicionar a feature original (tempo t)
+        final_selected_feature_columns.append(kept_orig_feat)
+    for i in range(1, n_lags + 1): # Adicionar seus lags
+        lag_name = f'{kept_orig_feat}_lag{i}'
+        if lag_name in X.columns:
+            final_selected_feature_columns.append(lag_name)
+
+# Adicionar outras colunas que você queira manter e não são parte do processo de 'feature_names_original'
+# (ex: lags do target se você os usa como features, ou features exógenas que não foram lagadas da mesma forma)
+# Aqui, vamos assumir que queremos manter os lags do target se eles existirem em X
+for i in range(1, n_lags + 1):
+    target_lag_name = f'{target_variable_name}_lag{i}'
+    if target_lag_name in X.columns and target_lag_name not in final_selected_feature_columns:
+        final_selected_feature_columns.append(target_lag_name)
+
+
+X_final_selected = X[final_selected_feature_columns].copy()
+
+print("\nDataFrame X com Features Selecionadas (X_final_selected):")
+print(X_final_selected.head())
+print(f"Shape de X_final_selected: {X_final_selected.shape}")
+
+# O DataFrame 'X_final_selected' e 'y' (que não mudou desde a remoção dos NaNs)
+# estão prontos para treinar seu modelo de forecast final.
