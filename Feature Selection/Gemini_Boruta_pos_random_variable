@@ -1,0 +1,265 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+# from sklearn.metrics import mean_squared_error # Não essencial para as funções de seleção
+
+# Certifique-se de ter boruta instalado: pip install boruta
+try:
+    from boruta import BorutaPy
+except ImportError:
+    print("Biblioteca BorutaPy não encontrada. Instale com: pip install boruta")
+    # Você pode optar por levantar um erro aqui ou permitir que o script continue sem Boruta
+    # raise
+
+# --- Função da Etapa 1: Seleção com Benchmark Aleatório (do passo anterior) ---
+# (Vou omitir o código completo aqui para brevidade, mas ele deve estar definido no seu script)
+# def select_features_by_random_benchmark(...):
+#     ...
+#     return X_selected, y_model_ready, kept_features_list, dropped_features_list, all_importances_df, importance_threshold
+
+# --- Função da Etapa 2: Seleção com Boruta ---
+def run_boruta_feature_selection(
+    X_input: pd.DataFrame,
+    y_input: pd.Series,
+    model_type: str = 'regressor',
+    # Parâmetros para o RandomForest usado DENTRO do Boruta
+    rf_n_estimators_boruta: any = 'auto', # Boruta lida bem com 'auto'
+    rf_max_depth_boruta: int = 7,         # Profundidade para as árvores (incluindo shadow)
+    # Parâmetros do BorutaPy
+    boruta_alpha: float = 0.05,    # Nível de significância estatística
+    boruta_max_iter: int = 100,    # Número máximo de iterações do Boruta
+    boruta_perc: int = 100,        # Percentil para o threshold (100 = usa o máximo da shadow)
+    # Outros
+    random_state: int = 42,
+    verbose: bool = True,
+    n_jobs_rf: int = -1 # Para o RandomForest dentro do Boruta
+) -> tuple:
+    """
+    Aplica o algoritmo Boruta para seleção de features.
+
+    Args:
+        X_input (pd.DataFrame): DataFrame de features de entrada.
+        y_input (pd.Series): Série do target.
+        model_type (str, optional): Tipo de RandomForest ('regressor' ou 'classifier')
+                                    a ser usado internamente pelo Boruta. Defaults to 'regressor'.
+        rf_n_estimators_boruta (any, optional): Número de estimadores para o RandomForest do Boruta.
+                                                Pode ser um int ou 'auto'. Defaults to 'auto'.
+        rf_max_depth_boruta (int, optional): Profundidade máxima para as árvores do RandomForest
+                                             do Boruta. Defaults to 7.
+        boruta_alpha (float, optional): Nível de significância estatística. Defaults to 0.05.
+        boruta_max_iter (int, optional): Número máximo de iterações do Boruta. Defaults to 100.
+        boruta_perc (int, optional): Percentil usado para encontrar o threshold nas importâncias
+                                     das shadow features. Defaults to 100 (usa o máximo).
+        random_state (int, optional): Seed para reprodutibilidade. Defaults to 42.
+        verbose (bool, optional): Se True, imprime informações durante a execução. BorutaPy tem
+                                  seu próprio sistema de verbosidade (0, 1, 2). Defaults to True.
+        n_jobs_rf (int, optional): Número de jobs para o RandomForest do Boruta (-1 usa todos os processadores).
+                                   Defaults to -1.
+
+    Returns:
+        tuple: Contendo:
+            - X_boruta_selected (pd.DataFrame): DataFrame com as features selecionadas pelo Boruta.
+            - kept_features_boruta (list): Lista dos nomes das features confirmadas pelo Boruta.
+            - boruta_selector (BorutaPy object): O objeto BorutaPy treinado para inspeção (pode ser None se Boruta não rodar).
+    """
+    if not 'BorutaPy' in globals():
+        if verbose:
+            print("   Aviso: BorutaPy não está disponível. Pulando esta etapa de seleção.")
+        return X_input, list(X_input.columns), None # Retorna entrada se Boruta não puder rodar
+
+    if verbose:
+        print("\n--- Iniciando Seleção de Features com Boruta ---")
+
+    if X_input.empty or y_input.empty:
+        if verbose:
+            print("   Aviso: X_input ou y_input está vazio. Retornando DataFrame de entrada.")
+        return X_input, list(X_input.columns) if not X_input.empty else [], None
+
+    # BorutaPy espera arrays NumPy.
+    # Manter os nomes das colunas para reconstruir o DataFrame depois.
+    original_columns = X_input.columns
+    X_np = X_input.values
+    y_np = y_input.values.ravel() # .ravel() para garantir que y seja 1D array
+
+    # 1. Definir o estimador (RandomForest) para Boruta
+    if model_type.lower() == 'regressor':
+        # Para Boruta, n_estimators é melhor deixar como 'auto' ou um valor fixo pequeno
+        # e controlar max_depth para evitar overfitting das shadow features.
+        rf_estimator = RandomForestRegressor(
+            n_estimators=rf_n_estimators_boruta if isinstance(rf_n_estimators_boruta, int) else 100, # BorutaPy lida com n_estimators internamente se 'auto'
+            max_depth=rf_max_depth_boruta,
+            random_state=random_state,
+            n_jobs=n_jobs_rf
+        )
+    elif model_type.lower() == 'classifier':
+        rf_estimator = RandomForestClassifier(
+            n_estimators=rf_n_estimators_boruta if isinstance(rf_n_estimators_boruta, int) else 100,
+            max_depth=rf_max_depth_boruta,
+            random_state=random_state,
+            n_jobs=n_jobs_rf,
+            class_weight='balanced' # Boa prática para classificação
+        )
+    else:
+        raise ValueError("model_type deve ser 'regressor' ou 'classifier'")
+
+    # 2. Inicializar BorutaPy
+    boruta_selector = BorutaPy(
+        estimator=rf_estimator,
+        n_estimators=rf_n_estimators_boruta, # Passa 'auto' ou o int para BorutaPy
+        perc=boruta_perc,
+        alpha=boruta_alpha,
+        max_iter=boruta_max_iter,
+        random_state=random_state,
+        verbose=2 if verbose else 0 # Boruta: 0 (silencioso), 1 (progresso), 2 (iter info)
+    )
+
+    # 3. Treinar Boruta
+    if verbose:
+        print(f"   Treinando BorutaPy (Estimador RF: n_est={rf_n_estimators_boruta}, max_depth={rf_max_depth_boruta}; Boruta: alpha={boruta_alpha}, max_iter={boruta_max_iter})...")
+        print(f"   Isso pode levar algum tempo dependendo do tamanho dos dados e de max_iter.")
+
+    try:
+        boruta_selector.fit(X_np, y_np)
+    except Exception as e:
+        if verbose:
+            print(f"   Erro durante o fit do BorutaPy: {e}")
+            print(f"   Retornando as features de entrada devido ao erro no Boruta.")
+        return X_input, list(original_columns), None # Retorna entrada em caso de erro
+
+    # 4. Obter as features selecionadas
+    # `boruta_selector.support_` : array booleano para features confirmadas como importantes.
+    # `boruta_selector.support_weak_`: array booleano para features tentativamente importantes.
+    # Geralmente, focamos nas `support_` para uma seleção mais conservadora.
+
+    confirmed_features_mask = boruta_selector.support_
+    # Para uma abordagem mais liberal, poderia incluir as 'weak'
+    # combined_mask = boruta_selector.support_ | boruta_selector.support_weak_
+    # kept_features_boruta = original_columns[combined_mask].tolist()
+
+    kept_features_boruta = original_columns[confirmed_features_mask].tolist()
+
+    X_boruta_selected = X_input[kept_features_boruta].copy() # .copy() para evitar SettingWithCopyWarning
+
+    if verbose:
+        print(f"\n   Resultados do Boruta:")
+        print(f"     Número de features de entrada: {X_input.shape[1]}")
+        print(f"     Número de features confirmadas pelo Boruta: {len(kept_features_boruta)}")
+        if kept_features_boruta:
+            print(f"     Features confirmadas (primeiras 10): {kept_features_boruta[:10]}")
+        else:
+            print("     Nenhuma feature confirmada pelo Boruta.")
+
+        # Opcional: Mostrar ranking para mais detalhes
+        # ranks = boruta_selector.ranking_
+        # feature_ranking_df = pd.DataFrame({'feature': original_columns, 'rank': ranks, 'confirmed': confirmed_features_mask})
+        # print("     Ranking das features pelo Boruta (menor é melhor):")
+        # print(feature_ranking_df.sort_values(by='rank').head(15))
+        print("--- Fim da Seleção de Features com Boruta ---")
+
+    return X_boruta_selected, kept_features_boruta, boruta_selector
+
+# --- Bloco Principal de Exemplo ---
+if __name__ == '__main__':
+    # Supondo que a função select_features_by_random_benchmark está definida acima ou importada
+    # Cole a definição da função select_features_by_random_benchmark aqui se não estiver em outro arquivo
+    # (código da função select_features_by_random_benchmark omitido para brevidade)
+
+    # Exemplo de dados (o mesmo da função anterior, mas pode adicionar mais features "ruins")
+    n_samples = 250 # Aumentar um pouco para Boruta ter mais dados
+    data_exemplo = {
+        'data_hora': pd.date_range(start='2023-01-01', periods=n_samples, freq='D'),
+        'vendas': np.random.rand(n_samples) * 50 + np.linspace(0, 20, n_samples) + np.sin(np.linspace(0, 50, n_samples)) * 10,
+        'preco': np.random.rand(n_samples) * 10 + 50,
+        'promocao': np.random.randint(0, 2, n_samples),
+        'evento_especial': np.random.choice([0,0,0,0,1], n_samples),
+        'temp_aleatoria_1': np.random.randn(n_samples) * 5,
+        'temp_aleatoria_2': np.random.uniform(-10, 10, n_samples),
+        'tendencia_ruido': np.linspace(0, 5, n_samples) + np.random.normal(0, 2, n_samples), # Pode ser útil ou não
+        'preco_quadrado': (data_exemplo['preco']**2) * 0.1, # Feature derivada, talvez redundante
+        'ruido_constante': np.ones(n_samples) * 7
+    }
+    df_teste = pd.DataFrame(data_exemplo)
+    df_teste = df_teste.set_index('data_hora')
+
+    print("DataFrame de Teste Original (primeiras linhas):")
+    print(df_teste.head())
+    print("-" * 70)
+
+    # Parâmetros
+    TARGET = 'vendas'
+    FEATURES_INICIAIS = [col for col in df_teste.columns if col != TARGET]
+    RANDOM_STATE_GLOBAL = 42
+
+    # --- ETAPA 1: Seleção com Benchmark Aleatório ---
+    print("\n=== ETAPA 1: Seleção com Benchmark Aleatório ===")
+    try:
+        # **COLE A DEFINIÇÃO DA FUNÇÃO select_features_by_random_benchmark AQUI**
+        # Exemplo de chamada (substitua pela sua função real)
+        # Supondo que você tenha a função select_features_by_random_benchmark definida:
+        X_bench_sel, y_bench_sel, kept_cols_bench, _, _, _ = select_features_by_random_benchmark(
+             df_original=df_teste.copy(),
+             target_column=TARGET,
+             feature_columns=FEATURES_INICIAIS,
+             n_lags=2,
+             n_random_features=4,
+             n_splits_ts=4,
+             model_type='regressor',
+             rf_random_state=RANDOM_STATE_GLOBAL,
+             verbose=True
+        )
+        print(f"\n   Após Benchmark Aleatório, {X_bench_sel.shape[1]} features mantidas (de {len(FEATURES_INICIAIS)} iniciais com lags).")
+        print(f"   Features mantidas (primeiras 10): {kept_cols_bench[:10]}")
+
+    except NameError:
+        print("ERRO: A função 'select_features_by_random_benchmark' não foi definida.")
+        print("Por favor, defina-a ou importe-a para rodar o exemplo completo.")
+        # Para continuar sem a primeira etapa para testar Boruta (não ideal):
+        # print("Pulando Etapa 1 e usando todas as features iniciais (sem lags) para Boruta.")
+        # X_bench_sel = df_teste[FEATURES_INICIAIS].copy()
+        # y_bench_sel = df_teste[TARGET].copy()
+        # # Simular o dropna que ocorreria na primeira etapa
+        # temp_df_for_y_shift = pd.concat([X_bench_sel, y_bench_sel.shift(-1).rename('y_shifted')], axis=1).dropna()
+        # X_bench_sel = temp_df_for_y_shift.drop(columns=['y_shifted'])
+        # y_bench_sel = temp_df_for_y_shift['y_shifted']
+        # if X_bench_sel.empty:
+        #     print("X_bench_sel vazio após simulação, não é possível prosseguir.")
+        #     exit()
+        X_bench_sel = pd.DataFrame() # Placeholder para o código rodar e falhar no Boruta
+        y_bench_sel = pd.Series()
+
+
+    # --- ETAPA 2: Seleção com Boruta ---
+    if not X_bench_sel.empty and 'BorutaPy' in globals():
+        print("\n\n=== ETAPA 2: Seleção com Boruta (sobre as features da Etapa 1) ===")
+        try:
+            X_boruta_final, kept_cols_boruta, boruta_obj = run_boruta_feature_selection(
+                X_input=X_bench_sel,
+                y_input=y_bench_sel, # y_bench_sel já está alinhado e sem NaNs
+                model_type='regressor',
+                rf_n_estimators_boruta='auto', # Deixar Boruta decidir
+                rf_max_depth_boruta=6,         # Controlar profundidade das shadow trees
+                boruta_max_iter=75,            # Menos iterações para o exemplo rodar mais rápido
+                random_state=RANDOM_STATE_GLOBAL,
+                verbose=True
+            )
+
+            print("\n--- RESULTADO FINAL APÓS BORUTA ---")
+            print(f"Features de entrada para Boruta: {X_bench_sel.shape[1]}")
+            print(f"Features finais mantidas após Boruta: {X_boruta_final.shape[1]}")
+            if kept_cols_boruta:
+                print(f"DataFrame X_boruta_final (primeiras linhas):\n{X_boruta_final.head()}")
+                print(f"\nLista de Features Finais Mantidas ({len(kept_cols_boruta)}): {kept_cols_boruta}")
+            else:
+                print("Nenhuma feature foi selecionada pelo Boruta.")
+
+            # X_boruta_final e y_bench_sel (que é o mesmo y) podem ser usados para treinar seu modelo final.
+
+        except Exception as e_boruta:
+            import traceback
+            print(f"Erro durante a execução da Etapa 2 (Boruta): {e_boruta}")
+            print(traceback.format_exc())
+    elif X_bench_sel.empty:
+        print("\nEtapa 2 (Boruta) não executada pois não há features da Etapa 1.")
+    elif not 'BorutaPy' in globals():
+        print("\nEtapa 2 (Boruta) não executada pois a biblioteca BorutaPy não foi carregada.")
