@@ -1,0 +1,368 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+# from sklearn.metrics import mean_squared_error # Removido pois não é essencial para a função de seleção
+
+def select_features_by_random_benchmark(
+    df_original: pd.DataFrame,
+    target_column: str,
+    feature_columns: list,
+    n_lags: int = 2,
+    n_random_features: int = 5,
+    n_splits_ts: int = 4,
+    model_type: str = 'regressor', # 'regressor' ou 'classifier'
+    rf_n_estimators: int = 100,
+    rf_random_state: int = 42,
+    verbose: bool = True
+) -> tuple:
+    """
+    Realiza a seleção de features usando um benchmark de features aleatórias.
+
+    A estratégia consiste em:
+    1. Criar lags para as variáveis especificadas.
+    2. Adicionar N variáveis aleatórias ao DataFrame.
+    3. Treinar um modelo RandomForest com TimeSeriesSplit.
+    4. Calcular a média da importância (feature importance) das variáveis aleatórias.
+    5. Eliminar features originais (e seus lags) se TODAS as suas variantes (original + lags)
+       tiverem importância menor que a média das aleatórias.
+    6. As features aleatórias são sempre removidas no final.
+
+    Args:
+        df_original (pd.DataFrame): DataFrame de entrada. Deve estar ordenado cronologicamente
+                                    se TimeSeriesSplit for usado de forma eficaz.
+        target_column (str): Nome da coluna alvo (o que se quer prever).
+        feature_columns (list): Lista de nomes das colunas a serem consideradas como features
+                                 iniciais (para lagging e análise).
+        n_lags (int, optional): Número de lags a serem criados para cada feature. Defaults to 2.
+        n_random_features (int, optional): Número de features aleatórias a serem adicionadas. Defaults to 5.
+        n_splits_ts (int, optional): Número de splits para o TimeSeriesSplit. Defaults to 4.
+        model_type (str, optional): Tipo de RandomForest ('regressor' ou 'classifier').
+                                    Defaults to 'regressor'.
+        rf_n_estimators (int, optional): Número de árvores no RandomForest. Defaults to 100.
+        rf_random_state (int, optional): Seed para reprodutibilidade do RandomForest e
+                                         das features aleatórias. Defaults to 42.
+        verbose (bool, optional): Se True, imprime informações durante a execução. Defaults to True.
+
+    Returns:
+        tuple: Contendo:
+            - X_selected (pd.DataFrame): DataFrame com as features selecionadas.
+            - y_model_ready (pd.Series): Série do target correspondente a X_selected.
+            - kept_features_list (list): Lista dos nomes das features mantidas.
+            - dropped_features_list (list): Lista dos nomes das features descartadas.
+            - all_importances_df (pd.DataFrame): DataFrame com as importâncias de todas as features
+                                                 (incluindo as aleatórias) antes da seleção final.
+            - importance_threshold (float): O threshold de importância calculado.
+    """
+    if verbose:
+        print("--- Iniciando Seleção de Features com Benchmark Aleatório ---")
+
+    df = df_original.copy() # Trabalhar com uma cópia
+
+    # --- 1. Criar Lags ---
+    if verbose:
+        print(f"\n1. Criando {n_lags} lags para features em: {feature_columns} e para '{target_column}' (se aplicável)...")
+
+    # Colunas para as quais criar lags (inclui features e pode incluir o target se ele também for usado como feature lagada)
+    cols_to_lag = list(set(feature_columns + ([target_column] if target_column in feature_columns else [])))
+    # Se o target não está nas feature_columns, mas queremos usar seus lags como features:
+    # (Exemplo: prever o target usando seus próprios valores passados e outras features)
+    # cols_to_lag = list(set(feature_columns + [target_column]))
+
+    for col in cols_to_lag:
+        if col in df.columns:
+            for i in range(1, n_lags + 1):
+                df[f'{col}_lag{i}'] = df[col].shift(i)
+        elif verbose:
+            print(f"   Aviso: Coluna '{col}' especificada para lag não encontrada no DataFrame.")
+    if verbose:
+        # print(f"   DataFrame após lags (primeiras linhas):\n{df.head()}")
+        print(f"   Shape após lags: {df.shape}")
+
+
+    # --- 2. Acrescentar Variáveis Aleatórias ---
+    if verbose:
+        print(f"\n2. Adicionando {n_random_features} features aleatórias...")
+    np.random.seed(rf_random_state) # Seed para reprodutibilidade das features aleatórias
+    random_feature_names = []
+    for i in range(n_random_features):
+        random_col_name = f'random_feature_benchmark_{i+1}'
+        df[random_col_name] = np.random.rand(len(df))
+        random_feature_names.append(random_col_name)
+    if verbose:
+        # print(f"   DataFrame com features aleatórias (primeiras linhas):\n{df.head()}")
+        print(f"   Shape após features aleatórias: {df.shape}")
+
+
+    # --- 3. Preparar X e y para o modelo ---
+    if verbose:
+        print("\n3. Preparando X e y para o modelo...")
+
+    # Definir y como o próximo valor do target (previsão 1-step ahead)
+    # Esta é uma escolha comum. Se o seu problema de forecast for diferente (ex: multi-step),
+    # você pode precisar ajustar esta parte ou passá-la como argumento.
+    df['y_target_shifted'] = df[target_column].shift(-1)
+
+    # Remover linhas com NaN criadas pelos lags e pelo shift do 'y'
+    df_model_ready = df.dropna().copy()
+
+    if df_model_ready.empty:
+        raise ValueError(
+            "DataFrame ficou vazio após dropar NaNs (devido a lags/shift). "
+            "Verifique o número de lags, o tamanho dos dados e a lógica de `dropna`."
+        )
+
+    # X não deve incluir a coluna 'y_target_shifted' nem a coluna target_column original (não lagada)
+    # para evitar data leakage se 'y_target_shifted' é uma versão shiftada dela.
+    # Lags da target_column SÃO permitidos e frequentemente úteis em X.
+    features_for_X = [col for col in df_model_ready.columns if col not in ['y_target_shifted', target_column]]
+
+    X = df_model_ready[features_for_X]
+    y = df_model_ready['y_target_shifted']
+
+    # Garantir que X contenha apenas tipos numéricos
+    X = X.select_dtypes(include=np.number)
+    feature_names_in_X = list(X.columns)
+
+    if X.empty or X.shape[1] == 0:
+        raise ValueError(
+            "O conjunto de features X está vazio após a preparação. "
+            "Verifique `feature_columns`, `target_column` e a criação de lags."
+        )
+    if verbose:
+        print(f"   Shape de X: {X.shape}, Shape de y: {y.shape}")
+        # print(f"   Features em X: {feature_names_in_X[:5]}...") # Mostra algumas features
+
+
+    # --- 4. Treinar RandomForest com TimeSeriesSplit e Coletar Feature Importances ---
+    if verbose:
+        print(f"\n4. Treinando RandomForest ({model_type}) com TimeSeriesSplit ({n_splits_ts} folds)...")
+
+    tscv = TimeSeriesSplit(n_splits=n_splits_ts)
+
+    if model_type.lower() == 'regressor':
+        model = RandomForestRegressor(n_estimators=rf_n_estimators, random_state=rf_random_state, n_jobs=-1)
+    elif model_type.lower() == 'classifier':
+        model = RandomForestClassifier(n_estimators=rf_n_estimators, random_state=rf_random_state, n_jobs=-1)
+    else:
+        raise ValueError("model_type deve ser 'regressor' ou 'classifier'")
+
+    fold_importances = []
+    min_samples_in_split = X.shape[0] // (n_splits_ts +1) # Heurística para verificar se há dados suficientes
+    if min_samples_in_split < 10: # Um número pequeno arbitrário; ajuste se necessário
+        print(f"   Aviso: Número de amostras por split ({min_samples_in_split}) pode ser muito pequeno.")
+
+
+    for fold, (train_index, val_index) in enumerate(tscv.split(X)):
+        if verbose:
+            print(f"     Fold {fold+1}/{n_splits_ts} - Treino: {len(train_index)}, Validação: {len(val_index)}")
+        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+        if X_train.empty or y_train.empty:
+            if verbose:
+                print(f"     Aviso: Fold {fold+1} tem dados de treino vazios. Pulando.")
+            continue
+        if X_val.empty or y_val.empty and verbose: # Validação vazia é menos crítica para importâncias
+             print(f"     Aviso: Fold {fold+1} tem dados de validação vazios.")
+
+
+        model.fit(X_train, y_train)
+        fold_importances.append(model.feature_importances_)
+
+    if not fold_importances:
+        raise ValueError(
+            "Nenhuma importância de feature foi coletada. "
+            "Isso pode ocorrer se todos os folds tiverem dados de treino/validação vazios. "
+            "Verifique `n_splits_ts` em relação ao tamanho dos dados após `dropna()`."
+        )
+
+    mean_feature_importances = np.mean(fold_importances, axis=0)
+    all_importances_df = pd.DataFrame({
+        'feature': feature_names_in_X,
+        'importance': mean_feature_importances
+    }).sort_values(by='importance', ascending=False).reset_index(drop=True)
+
+    if verbose:
+        print("   Média das Feature Importances (todos os folds) calculada.")
+        # print(all_importances_df.head())
+
+
+    # --- 5. Calcular a média de feature importance das variáveis aleatórias ---
+    if verbose:
+        print("\n5. Calculando o threshold de importância (média das features aleatórias)...")
+    random_features_actual_in_X = [rf_name for rf_name in random_feature_names if rf_name in all_importances_df['feature'].values]
+
+    if not random_features_actual_in_X:
+        print("   Aviso: Nenhuma das features aleatórias nomeadas foi encontrada nas importâncias calculadas. Usando threshold = 0.")
+        importance_threshold = 0.0
+    else:
+        random_importances = all_importances_df[
+            all_importances_df['feature'].isin(random_features_actual_in_X)
+        ]['importance']
+        if random_importances.empty:
+             print("   Aviso: Features aleatórias encontradas nos nomes, mas sem valor de importância. Usando threshold = 0.")
+             importance_threshold = 0.0
+        else:
+            importance_threshold = random_importances.mean()
+
+    if verbose:
+        # print(f"   Importâncias das features aleatórias:\n{random_importances if not random_importances.empty else 'N/A'}")
+        print(f"   Threshold de importância (média das aleatórias): {importance_threshold:.6f}")
+
+
+    # --- 6. Analisar e Selecionar Features ---
+    if verbose:
+        print("\n6. Analisando features para eliminação com base no threshold...")
+    features_to_drop_set = set()
+    features_to_keep_set = set(feature_names_in_X) # Começa com todas
+
+    # Identificar as "bases" das features em X (excluindo as aleatórias de benchmark)
+    base_feature_candidates = set()
+    for f_name in feature_names_in_X:
+        if f_name.startswith('random_feature_benchmark_'):
+            continue
+        base_name = f_name.split('_lag')[0]
+        base_feature_candidates.add(base_name)
+
+    for base_feature_name in sorted(list(base_feature_candidates)):
+        # Encontrar todas as features relacionadas (original + lags) que estão em X
+        related_features_in_X = []
+        if base_feature_name in feature_names_in_X: # A própria feature base (sem lag)
+            related_features_in_X.append(base_feature_name)
+        for i in range(1, n_lags + 1): # Lags da feature base
+            lagged_name = f'{base_feature_name}_lag{i}'
+            if lagged_name in feature_names_in_X:
+                related_features_in_X.append(lagged_name)
+
+        if not related_features_in_X:
+            continue # Não há variantes desta base em X (improvável se base_feature_name veio de X)
+
+        all_related_below_threshold = True
+        if verbose:
+            print(f"   Analisando base feature: '{base_feature_name}'")
+
+        for related_feat in related_features_in_X:
+            # Obter importância. Usar .loc e .iloc[0] para garantir que pegamos o valor escalar.
+            feat_importance_series = all_importances_df.loc[all_importances_df['feature'] == related_feat, 'importance']
+            if feat_importance_series.empty:
+                 if verbose: print(f"     - '{related_feat}': importância não encontrada (pode ter sido filtrada antes). Assumindo abaixo do threshold para segurança.");
+                 feat_importance = -1.0 # Garante que conte como abaixo se não encontrada
+            else:
+                feat_importance = feat_importance_series.iloc[0]
+
+            if verbose:
+                print(f"     - '{related_feat}': importância = {feat_importance:.6f}")
+
+            if feat_importance >= importance_threshold:
+                all_related_below_threshold = False
+                if verbose:
+                    print(f"       --> '{related_feat}' está ACIMA ou IGUAL ao threshold. '{base_feature_name}' e seus lags serão MANTIDOS.")
+                break # Uma acima do threshold salva o grupo
+
+        if all_related_below_threshold:
+            if verbose:
+                print(f"     --> TODAS as features relacionadas a '{base_feature_name}' estão ABAIXO do threshold. Serão ELIMINADAS.")
+            for feat_to_remove in related_features_in_X:
+                features_to_drop_set.add(feat_to_remove)
+                if feat_to_remove in features_to_keep_set:
+                    features_to_keep_set.remove(feat_to_remove)
+
+    # Adicionar as features aleatórias à lista de descarte, pois cumpriram seu papel
+    for rf_name in random_feature_names:
+        if rf_name in feature_names_in_X:
+            features_to_drop_set.add(rf_name)
+            if rf_name in features_to_keep_set:
+                features_to_keep_set.remove(rf_name)
+
+    kept_features_list = sorted(list(features_to_keep_set))
+    dropped_features_list = sorted(list(features_to_drop_set))
+
+    # DataFrame final com features selecionadas
+    X_selected = X[kept_features_list].copy() # .copy() para evitar warnings em usos futuros
+    y_model_ready = y.copy() # Retornar y alinhado com X_selected
+
+    if verbose:
+        print("\n--- RESULTADO DA SELEÇÃO DE FEATURES ---")
+        print(f"Threshold de importância final: {importance_threshold:.6f}")
+        print(f"\nFeatures MANTIDAS ({len(kept_features_list)}):")
+        if kept_features_list:
+            for f in kept_features_list: print(f"  - {f}")
+        else:
+            print("  Nenhuma feature foi mantida! Verifique o threshold ou as importâncias.")
+
+        print(f"\nFeatures DESCARTADAS ({len(dropped_features_list)}):")
+        if dropped_features_list:
+            # Para clareza, separar as descartadas que são 'originais/lags' das 'aleatórias'
+            orig_dropped = [f for f in dropped_features_list if not f.startswith('random_feature_benchmark_')]
+            rand_dropped = [f for f in dropped_features_list if f.startswith('random_feature_benchmark_')]
+            if orig_dropped:
+                print("  Originais/Lags:")
+                for f in orig_dropped: print(f"    - {f}")
+            if rand_dropped:
+                print("  Aleatórias (Benchmark):")
+                for f in rand_dropped: print(f"    - {f}")
+        else:
+            print("  Nenhuma feature marcada para descarte (além das aleatórias, se houver).")
+
+        print(f"\nShape final de X_selected: {X_selected.shape}")
+        print("--- Fim da Seleção de Features ---")
+
+    return X_selected, y_model_ready, kept_features_list, dropped_features_list, all_importances_df, importance_threshold
+
+
+if __name__ == '__main__':
+    # --- Exemplo de Uso da Função ---
+
+    # 1. Gerar Dados de Exemplo
+    n_samples = 200
+    data_exemplo = {
+        'data_hora': pd.date_range(start='2023-01-01', periods=n_samples, freq='D'),
+        'vendas': np.random.rand(n_samples) * 50 + np.linspace(0, 20, n_samples) + np.sin(np.linspace(0, 50, n_samples)) * 10,
+        'preco': np.random.rand(n_samples) * 10 + 50,
+        'promocao': np.random.randint(0, 2, n_samples), # Feature binária
+        'evento_especial': np.random.choice([0,0,0,0,1], n_samples) # Feature esparsa
+    }
+    df_teste = pd.DataFrame(data_exemplo)
+    df_teste = df_teste.set_index('data_hora') # Importante para TimeSeriesSplit se o índice for usado
+
+    print("DataFrame de Teste Original (primeiras linhas):")
+    print(df_teste.head())
+    print("-" * 50)
+
+    # 2. Definir Parâmetros para a Função
+    TARGET = 'vendas'
+    FEATURES_INICIAIS = ['preco', 'promocao', 'evento_especial'] # 'vendas' será lagada também se incluída aqui ou implicitamente
+
+    # 3. Chamar a Função
+    try:
+        X_sel, y_sel, kept_cols, dropped_cols, all_imps, thresh = select_features_by_random_benchmark(
+            df_original=df_teste,
+            target_column=TARGET,
+            feature_columns=FEATURES_INICIAIS,
+            n_lags=3,
+            n_random_features=5,
+            n_splits_ts=5, # Aumentado para mais robustez com mais dados
+            model_type='regressor', # ou 'classifier' se o target fosse categórico
+            rf_random_state=123,
+            verbose=True
+        )
+
+        print("\n--- Saídas da Função ---")
+        print(f"\nDataFrame X_selected (primeiras linhas):\n{X_sel.head()}")
+        print(f"\nSérie y_sel (primeiras linhas):\n{y_sel.head()}")
+        print(f"\nFeatures Mantidas: {kept_cols}")
+        # print(f"\nFeatures Descartadas: {dropped_cols}")
+        # print(f"\nTodas as Importâncias:\n{all_imps}")
+        # print(f"\nThreshold Usado: {thresh}")
+
+        # Agora X_sel e y_sel podem ser usados para treinar um modelo de forecast final.
+        # Exemplo:
+        # final_model = RandomForestRegressor(random_state=123)
+        # final_model.fit(X_sel, y_sel)
+        # print("\nModelo final treinado com features selecionadas.")
+
+    except ValueError as e:
+        print(f"\nErro durante a execução da seleção de features: {e}")
+    except Exception as e:
+        print(f"\nOcorreu um erro inesperado: {e}")
