@@ -1,0 +1,316 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from boruta import BorutaPy # Certifique-se de ter o BorutaPy instalado: pip install Boruta
+
+def select_features_with_boruta(
+    df_original: pd.DataFrame,
+    target_column: str,
+    feature_columns: list,
+    n_lags: int = 2,
+    y_is_future: bool = False, # NOVO PARÂMETRO
+    y_shift_periods: int = 1,  # NOVO PARÂMETRO, relevante se y_is_future=True
+    model_type: str = 'regressor', # 'regressor' ou 'classifier'
+    rf_n_estimators: int = 100,
+    boruta_n_estimators: any = 'auto',
+    boruta_max_iter: int = 100,
+    boruta_perc: int = 100,
+    random_state: int = 42,
+    verbose: int = 1
+) -> tuple:
+    """
+    Realiza a seleção de features usando o algoritmo Boruta.
+
+    A estratégia consiste em:
+    1. Criar lags para as variáveis especificadas (features e opcionalmente o target).
+    2. Preparar X e y:
+       - Se y_is_future for True, o target_column é shiftado por -y_shift_periods
+         para criar o y de previsão futura.
+       - Remover NaNs gerados pelos lags e pelo possível shift do y.
+    3. Treinar o BorutaPy com um RandomForest para identificar features relevantes.
+    4. Retornar as features selecionadas.
+
+    Args:
+        df_original (pd.DataFrame): DataFrame de entrada.
+        target_column (str): Nome da coluna alvo.
+        feature_columns (list): Lista de nomes das colunas a serem consideradas como features
+                                 iniciais (para lagging e análise).
+        n_lags (int, optional): Número de lags a serem criados. Defaults to 2.
+        y_is_future (bool, optional): Se True, o target_column será shiftado para criar um y
+                                      de previsão futura (1-step ahead por padrão).
+                                      Se False, o target_column original é usado como y.
+                                      Defaults to False.
+        y_shift_periods (int, optional): Número de períodos para shif_tar o y para o futuro
+                                         (shift negativo). Relevante apenas se y_is_future=True.
+                                         Defaults to 1 (para previsão 1-step ahead).
+        model_type (str, optional): Tipo de RandomForest ('regressor' ou 'classifier').
+                                    Defaults to 'regressor'.
+        rf_n_estimators (int, optional): Número de árvores no RandomForest base. Defaults to 100.
+        boruta_n_estimators (any, optional): n_estimators para o BorutaPy. Defaults to 'auto'.
+        boruta_max_iter (int, optional): Máximo de iterações do Boruta. Defaults to 100.
+        boruta_perc (int, optional): Percentil para o threshold do Boruta. Defaults to 100.
+        random_state (int, optional): Seed para reprodutibilidade. Defaults to 42.
+        verbose (int, optional): Nível de verbosidade do Boruta (0, 1 ou 2). Defaults to 1.
+
+    Returns:
+        tuple: Contendo:
+            - X_selected_boruta (pd.DataFrame): DataFrame com as features selecionadas.
+            - y_boruta_ready (pd.Series): Série do target correspondente a X_selected_boruta.
+            - kept_features_boruta (list): Lista dos nomes das features mantidas.
+            - all_features_ranking_df (pd.DataFrame): DataFrame com o ranking de todas as features.
+    """
+    if verbose > 0:
+        print("--- Iniciando Seleção de Features com Boruta ---")
+
+    df = df_original.copy()
+
+    # --- 1. Criar Lags ---
+    if verbose > 0:
+        print(f"\n1. Criando {n_lags} lags para features em: {feature_columns}...")
+
+    # Lags são criados para as 'feature_columns'.
+    # Se 'target_column' estiver em 'feature_columns', seus lags também serão criados.
+    # Estes lags do target podem ser usados para prever tanto o target atual quanto o target futuro.
+    cols_to_lag = list(set(feature_columns))
+
+    for col in cols_to_lag:
+        if col in df.columns:
+            for i in range(1, n_lags + 1):
+                df[f'{col}_lag{i}'] = df[col].shift(i)
+        elif verbose > 0:
+            print(f"   Aviso: Coluna '{col}' especificada para lag não encontrada no DataFrame.")
+    if verbose > 0:
+        print(f"   Shape após lags: {df.shape}")
+
+    # --- 2. Preparar X e y para o Boruta ---
+    y_final_column_name = target_column
+    columns_to_exclude_from_X = [target_column] # O target original sempre é excluído de X
+
+    if y_is_future:
+        if y_shift_periods <= 0:
+            raise ValueError("y_shift_periods deve ser positivo quando y_is_future é True.")
+        shifted_y_name = f"{target_column}_shifted_future"
+        df[shifted_y_name] = df[target_column].shift(-y_shift_periods)
+        y_final_column_name = shifted_y_name
+        columns_to_exclude_from_X.append(shifted_y_name) # O y shiftado também é excluído de X
+        if verbose > 0:
+            print(f"\n   Target '{target_column}' foi shiftado por {-y_shift_periods} períodos para '{shifted_y_name}' (y_is_future=True).")
+
+    if verbose > 0:
+        print(f"\n2. Preparando X e y para o Boruta (y final: '{y_final_column_name}')...")
+
+    df_model_ready = df.dropna(subset=[y_final_column_name] + [col for col in df.columns if '_lag' in col]).copy()
+    # O dropna considera o y final (que pode ter NaNs do shift) e qualquer coluna com lag.
+
+    if df_model_ready.empty:
+        raise ValueError(
+            "DataFrame ficou vazio após dropar NaNs (devido a lags e/ou shift do y). "
+            "Verifique n_lags, y_shift_periods, e o tamanho dos dados."
+        )
+
+    # X não deve incluir a coluna target_column original nem a y_final_column_name (se for diferente)
+    # Todas as outras colunas (incluindo lags do target, se criados a partir de feature_columns) são candidatas a X
+    potential_feature_names_for_X = [
+        col for col in df_model_ready.columns if col not in columns_to_exclude_from_X
+    ]
+
+    X_full = df_model_ready[potential_feature_names_for_X]
+    y = df_model_ready[y_final_column_name] # Usa o nome final do y (original ou shiftado)
+
+    X_full = X_full.select_dtypes(include=np.number)
+    feature_names_in_X_full = list(X_full.columns)
+
+    if X_full.empty or X_full.shape[1] == 0:
+        raise ValueError(
+            "O conjunto de features X está vazio após a preparação. "
+            "Verifique `feature_columns`, `target_column` e a criação de lags."
+        )
+    if verbose > 0:
+        print(f"   Shape de X_full (antes do Boruta): {X_full.shape}, Shape de y: {y.shape}")
+        if verbose > 1 and len(feature_names_in_X_full) > 5:
+             print(f"   Algumas Features em X_full: {feature_names_in_X_full[:5]}...")
+
+    # --- 3. Treinar Boruta ---
+    if verbose > 0:
+        print(f"\n3. Treinando Boruta com RandomForest ({model_type})...")
+
+    if model_type.lower() == 'regressor':
+        base_estimator = RandomForestRegressor(
+            n_estimators=rf_n_estimators, random_state=random_state, n_jobs=-1
+        )
+    elif model_type.lower() == 'classifier':
+        base_estimator = RandomForestClassifier(
+            n_estimators=rf_n_estimators, random_state=random_state, n_jobs=-1
+        )
+    else:
+        raise ValueError("model_type deve ser 'regressor' ou 'classifier'")
+
+    boruta_selector = BorutaPy(
+        estimator=base_estimator,
+        n_estimators=boruta_n_estimators if boruta_n_estimators != 'auto' else rf_n_estimators,
+        perc=boruta_perc,
+        max_iter=boruta_max_iter,
+        random_state=random_state,
+        verbose=verbose
+    )
+
+    X_np = X_full.values
+    y_np = y.values.ravel()
+
+    if verbose > 0:
+        print(f"   Iniciando BorutaPy.fit com X_np shape: {X_np.shape}, y_np shape: {y_np.shape}")
+        print(f"   Parâmetros do Boruta: n_estimators={boruta_selector.n_estimators}, perc={boruta_selector.perc}, max_iter={boruta_selector.max_iter}")
+
+    try:
+        boruta_selector.fit(X_np, y_np)
+    except Exception as e:
+        print(f"   Erro durante BorutaPy.fit: {e}")
+        if 'Found array with 0 feature' in str(e) or 'Found array with 0 sample' in str(e):
+             raise ValueError(f"Erro no Boruta: Dados de entrada X ou y têm dimensão zero. X_np shape: {X_np.shape}, y_np shape: {y_np.shape}. Detalhe: {e}") from e
+
+    # --- 4. Coletar Resultados do Boruta ---
+    if verbose > 0:
+        print("\n4. Coletando resultados do Boruta...")
+
+    kept_features_mask = boruta_selector.support_
+    kept_features_boruta = X_full.columns[kept_features_mask].tolist()
+    weak_features_mask = boruta_selector.support_weak_
+    weak_features_boruta = X_full.columns[weak_features_mask].tolist()
+
+    all_features_ranking_df = pd.DataFrame({
+        'feature': X_full.columns,
+        'ranking': boruta_selector.ranking_,
+        'confirmed': boruta_selector.support_,
+        'tentative': boruta_selector.support_weak_
+    }).sort_values(by='ranking').reset_index(drop=True)
+
+    if not kept_features_boruta:
+        if verbose > 0:
+            print("   Aviso: Boruta não confirmou nenhuma feature como importante.")
+        X_selected_boruta = pd.DataFrame(index=X_full.index)
+    else:
+        X_selected_boruta = X_full[kept_features_boruta].copy()
+
+    y_boruta_ready = y.copy()
+
+    if verbose > 0:
+        print("\n--- RESULTADO DA SELEÇÃO DE FEATURES COM BORUTA ---")
+        print(f"Features MANTIDAS (Confirmadas) ({len(kept_features_boruta)}):")
+        if kept_features_boruta:
+            for f in kept_features_boruta: print(f"  - {f}")
+        else:
+            print("  Nenhuma feature confirmada pelo Boruta.")
+
+        print(f"\nFeatures TENTATIVAS (Fracas) ({len(weak_features_boruta)}):")
+        if weak_features_boruta:
+            for f in weak_features_boruta: print(f"  - {f}")
+        else:
+            print("  Nenhuma feature marcada como tentativa.")
+
+        print(f"\nShape final de X_selected_boruta: {X_selected_boruta.shape}")
+        print("--- Fim da Seleção de Features com Boruta ---")
+
+    return X_selected_boruta, y_boruta_ready, kept_features_boruta, all_features_ranking_df
+
+
+if __name__ == '__main__':
+    # --- Exemplo de Uso da Função Boruta ---
+    n_samples = 200
+    data_exemplo_boruta = {
+        'data_hora': pd.date_range(start='2023-01-01', periods=n_samples, freq='D'),
+        'vendas': np.random.rand(n_samples) * 50 + np.linspace(0, 20, n_samples) + np.sin(np.linspace(0, 50, n_samples)) * 10,
+        'preco': np.random.rand(n_samples) * 10 + 50,
+        'promocao': np.random.randint(0, 2, n_samples),
+        'evento_especial': np.random.choice([0,0,0,0,1], n_samples),
+        'feature_ruidosa_1': np.random.randn(n_samples) * 5,
+        'feature_ruidosa_2': np.random.uniform(0,1, n_samples)
+    }
+    df_teste_boruta = pd.DataFrame(data_exemplo_boruta)
+    df_teste_boruta = df_teste_boruta.set_index('data_hora')
+
+    print("DataFrame de Teste Original para Boruta (primeiras linhas):")
+    print(df_teste_boruta.head())
+    print("-" * 50)
+
+    TARGET_BORUTA = 'vendas'
+    # Incluir 'vendas' em FEATURES_INICIAIS_BORUTA para criar seus lags,
+    # que podem ser úteis para prever tanto vendas(t) quanto vendas(t+1).
+    FEATURES_INICIAIS_BORUTA = ['preco', 'promocao', 'evento_especial', 'feature_ruidosa_1', 'feature_ruidosa_2', 'vendas']
+
+    # Cenário 1: Modelar vendas(t) com features(t) e lags (y_is_future=False)
+    print("\n--- Cenário 1: Modelar vendas(t) com features(t) e lags (y_is_future=False) ---")
+    try:
+        X_sel_b1, y_sel_b1, kept_b1, rank_b1 = select_features_with_boruta(
+            df_original=df_teste_boruta.copy(), # Passar uma cópia para não modificar o original
+            target_column=TARGET_BORUTA,
+            feature_columns=FEATURES_INICIAIS_BORUTA,
+            n_lags=3,
+            y_is_future=False, # <--- AQUI
+            model_type='regressor',
+            rf_n_estimators=100,
+            boruta_max_iter=50,
+            random_state=123,
+            verbose=1
+        )
+        print("\n--- Saídas da Função Boruta (Cenário 1) ---")
+        print(f"Shape X_selected: {X_sel_b1.shape}, Shape y_selected: {y_sel_b1.shape}")
+        print(f"Features Mantidas: {kept_b1}")
+        # print(f"Ranking (top 5):\n{rank_b1.head()}")
+
+    except ValueError as e:
+        print(f"\nErro (Cenário 1): {e}")
+    except Exception as e:
+        print(f"\nErro inesperado (Cenário 1): {e}")
+
+
+    # Cenário 2: Prever vendas(t+1) com features(t) e lags (y_is_future=True)
+    print("\n\n--- Cenário 2: Prever vendas(t+1) com features(t) e lags (y_is_future=True) ---")
+    try:
+        X_sel_b2, y_sel_b2, kept_b2, rank_b2 = select_features_with_boruta(
+            df_original=df_teste_boruta.copy(), # Passar uma cópia
+            target_column=TARGET_BORUTA,
+            feature_columns=FEATURES_INICIAIS_BORUTA,
+            n_lags=3,
+            y_is_future=True,         # <--- AQUI
+            y_shift_periods=1,        # <--- Para 1 passo à frente
+            model_type='regressor',
+            rf_n_estimators=100,
+            boruta_max_iter=50,
+            random_state=123,
+            verbose=1
+        )
+        print("\n--- Saídas da Função Boruta (Cenário 2) ---")
+        print(f"Shape X_selected: {X_sel_b2.shape}, Shape y_selected: {y_sel_b2.shape}")
+        print(f"Features Mantidas: {kept_b2}")
+        # print(f"Ranking (top 5):\n{rank_b2.head()}")
+
+    except ValueError as e:
+        print(f"\nErro (Cenário 2): {e}")
+    except Exception as e:
+        print(f"\nErro inesperado (Cenário 2): {e}")
+
+    # Cenário 3: Prever vendas(t+2) com features(t) e lags (y_is_future=True, y_shift_periods=2)
+    print("\n\n--- Cenário 3: Prever vendas(t+2) com features(t) e lags (y_is_future=True, y_shift_periods=2) ---")
+    try:
+        X_sel_b3, y_sel_b3, kept_b3, rank_b3 = select_features_with_boruta(
+            df_original=df_teste_boruta.copy(), # Passar uma cópia
+            target_column=TARGET_BORUTA,
+            feature_columns=FEATURES_INICIAIS_BORUTA,
+            n_lags=3,
+            y_is_future=True,         # <--- AQUI
+            y_shift_periods=2,        # <--- Para 2 passos à frente
+            model_type='regressor',
+            rf_n_estimators=100,
+            boruta_max_iter=50,
+            random_state=123,
+            verbose=1
+        )
+        print("\n--- Saídas da Função Boruta (Cenário 3) ---")
+        print(f"Shape X_selected: {X_sel_b3.shape}, Shape y_selected: {y_sel_b3.shape}")
+        print(f"Features Mantidas: {kept_b3}")
+        # print(f"Ranking (top 5):\n{rank_b3.head()}")
+
+    except ValueError as e:
+        print(f"\nErro (Cenário 3): {e}")
+    except Exception as e:
+        print(f"\nErro inesperado (Cenário 3): {e}")
