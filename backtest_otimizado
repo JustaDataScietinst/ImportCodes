@@ -99,34 +99,15 @@ def calcula_vertices_com_sua_logica_de_datas(df: pd.DataFrame, VERTICE, COBERTUR
 
     return df_resultado
 
-
-
+#############################
 
 
 
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from numba import jit
 
-# Apenas a função do hedge com Numba, pois cummax do Pandas estourou a memória
-@jit(nopython=True)
-def calcula_vetor_hedge_numba_para_simulacao_isolada(vetor_vf_local, cobertura_hedge_local):
-    vetor_hedge_local = np.zeros_like(vetor_vf_local)
-    if len(vetor_vf_local) == 0:
-        return vetor_hedge_local
-    primeiro_hedge = vetor_vf_local[0] * cobertura_hedge_local
-    vetor_hedge_local[0] = primeiro_hedge
-    for idx_loop in range(1, len(vetor_vf_local)):
-        hedge_do_dia = vetor_vf_local[idx_loop] * cobertura_hedge_local
-        hedge_anterior = vetor_hedge_local[idx_loop-1]
-        if hedge_do_dia > hedge_anterior:
-            vetor_hedge_local[idx_loop] = hedge_do_dia
-        else:
-            vetor_hedge_local[idx_loop] = hedge_anterior
-    return vetor_hedge_local
-
-def simulacao_hedge_revisada(df: pd.DataFrame, VERTICES: list, COBERTURAS_HEDGE: list) -> pd.DataFrame:
+def simulacao_hedge_cumsum_cummax(df: pd.DataFrame, VERTICES: list, COBERTURAS_HEDGE: list) -> pd.DataFrame:
     df_resultados_lista = []
     
     for VERTICE in VERTICES:
@@ -135,57 +116,51 @@ def simulacao_hedge_revisada(df: pd.DataFrame, VERTICES: list, COBERTURAS_HEDGE:
         if df_vertice_filtrado.empty:
             continue
 
-        data_inicio = df_vertice_filtrado['INICIO'].min()
-        data_fim = df_vertice_filtrado['FIM'].max().to_period('M').to_timestamp('D') + timedelta(days=1)
-        datas_range = pd.date_range(start=data_inicio, end=data_fim, freq='D')
+        # Sua lógica original de datas
+        data_inicio_range = df_vertice_filtrado['INICIO'].min()
+        data_fim_para_iloc = df_vertice_filtrado['FIM'].max().to_period('M').to_timestamp('D') + timedelta(days=1)
+        
+        datas_range = pd.date_range(start=data_inicio_range, end=data_fim_para_iloc, freq='D')
 
         if datas_range.empty:
             continue
 
-        vetor_vf = np.zeros(len(datas_range), dtype='float32')
+        vetor_deltas_vf = np.zeros(len(datas_range), dtype='float32')
 
-        # --- Loop 1: Python Puro com Slicing NumPy ---
-        # (Replicando a lógica do seu código original, assumindo que 'fim_idx' era exclusivo)
-        inicios_rel_np = (df_vertice_filtrado['INICIO'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(int)
-        # fims_rel_np é o índice do último dia do evento (inclusivo)
-        fims_rel_np_inclusivo = (df_vertice_filtrado['FIM'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(int)
-        fnvlrliber_np = df_vertice_filtrado['FNVLRLIBER'].astype('float32').values
-        len_r = len(datas_range)
+        # --- Loop para preencher vetor_deltas_vf (Otimizado com NumPy, sem iterrows) ---
+        inicios_evento_dt_np = df_vertice_filtrado['INICIO'].values
+        fims_evento_dt_np = df_vertice_filtrado['FIM'].values # Assumindo que FIM é o último dia INCLUSIVO
+        fnvlrliber_np_arr = df_vertice_filtrado['FNVLRLIBER'].astype('float32').values
+        
+        data_inicio_range_np_dt64 = np.datetime64(data_inicio_range)
 
         for i in range(len(df_vertice_filtrado)):
-            # Lógica original de índices para o slice:
-            # inicio_idx = max(0, (row['INICIO' ] - data_inicio).days)
-            # fim_idx = min(len(datas_range) - 1, (row['FIM' ] - data_inicio).days)
-            # vetor_vf[inicio_idx:fim_idx] += row['FNVLRLIBER']
+            idx_inicio = (inicios_evento_dt_np[i] - data_inicio_range_np_dt64).astype('timedelta64[D]').astype(int)
+            idx_fim_mais_um = (fims_evento_dt_np[i] - data_inicio_range_np_dt64).astype('timedelta64[D]').astype(int) + 1
+            valor_liber = fnvlrliber_np_arr[i]
 
-            # Replicando:
-            # inicio_idx_para_slice é o primeiro índice do slice (inclusivo)
-            inicio_idx_para_slice = max(0, inicios_rel_np[i])
+            if 0 <= idx_inicio < len(vetor_deltas_vf):
+                vetor_deltas_vf[idx_inicio] += valor_liber
             
-            # fim_idx_para_slice é o primeiro índice NÃO incluído no slice (exclusivo)
-            # Sua lógica original para fim_idx era: min(len(datas_range) - 1, (row['FIM'] - data_inicio).days)
-            # Se (row['FIM'] - data_inicio).days era o último índice a ser INCLUÍDO, então o slice o excluía.
-            # Se (row['FIM'] - data_inicio).days era o primeiro a ser EXCLUÍDO, estava correto.
-            # Vamos assumir que fims_rel_np_inclusivo[i] é o índice do último dia a ser incluído.
-            # Para que o slice o inclua, o limite superior deve ser fims_rel_np_inclusivo[i] + 1.
-            # E então aplicamos o min com len(datas_range) para não estourar o array.
-            
-            # OPÇÃO A: Se fims_rel_np_inclusivo[i] é o ÚLTIMO ÍNDICE A SER INCLUÍDO
-            fim_idx_para_slice_exclusivo = min(len_r, fims_rel_np_inclusivo[i] + 1)
-            
-            # OPÇÃO B: Se a sua intenção original com `min(len(datas_range) - 1, (row['FIM'] - data_inicio).days)`
-            # era que (row['FIM'] - data_inicio).days fosse o limite superior EXCLUSIVO do slice,
-            # mas também limitado pelo penúltimo elemento do array (o que é estranho para um limite de slice).
-            # Vamos usar a OPÇÃO A, que é mais comum: FIM é o último dia incluído.
-
-            if inicio_idx_para_slice < fim_idx_para_slice_exclusivo: # Garante que o slice é válido
-                vetor_vf[inicio_idx_para_slice : fim_idx_para_slice_exclusivo] += fnvlrliber_np[i]
-        # --- Fim do Loop 1 ---
+            if 0 <= idx_fim_mais_um < len(vetor_deltas_vf):
+                vetor_deltas_vf[idx_fim_mais_um] -= valor_liber
+        
+        vetor_vf = np.cumsum(vetor_deltas_vf, dtype='float32')
+        # --- Fim do cálculo de vetor_vf ---
 
         df_resultado_vertice = pd.DataFrame({'DATA_POSICAO': datas_range, 'VF': vetor_vf})
 
+        # Loop para COBERTURAS_HEDGE
         for cobertura_val in COBERTURAS_HEDGE:
-            vetor_hedge_calculado = calcula_vetor_hedge_numba_para_simulacao_isolada(vetor_vf, float(cobertura_val))
+            # Calcula o valor base do hedge para cada dia
+            hedge_diario_base = vetor_vf * cobertura_val # cobertura_val é float
+            
+            # Calcula o vetor_hedge como o máximo cumulativo do hedge_diario_base
+            # Esta é a otimização chave se cummax() funciona para você!
+            if len(hedge_diario_base) > 0:
+                vetor_hedge_calculado = pd.Series(hedge_diario_base).cummax().to_numpy(dtype='float32')
+            else:
+                vetor_hedge_calculado = np.array([], dtype='float32') # Ou np.zeros_like(vetor_vf)
             
             col_hedge_nome = f'HEDGE_{cobertura_val:.2f}'.replace('.',',')
             col_validacao_nome = f'VALIDACAO_{cobertura_val:.2f}'.replace('.',',')
