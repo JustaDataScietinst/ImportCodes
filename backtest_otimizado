@@ -1,0 +1,89 @@
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+from numba import jit # Importar Numba
+
+# --- Funções compiladas com Numba ---
+@jit(nopython=True)
+def preenche_vetor_vf_numba(vetor_vf_arr, inicios_arr, fims_arr, fnvlrliber_arr, len_df_vertice, len_datas_range):
+    for i in range(len_df_vertice):
+        idx_inicio_evento = inicios_arr[i]
+        idx_fim_evento = fims_arr[i] # Este é o índice do último dia a ser incluído
+
+        idx_inicio_valido_no_vetor = max(0, idx_inicio_evento)
+        # Para o slicing implícito no loop k, o fim é exclusivo.
+        # Se idx_fim_evento é o último dia, o loop k vai até idx_fim_evento.
+        idx_fim_valido_para_loop_k = min(len_datas_range -1 , idx_fim_evento) # Garante que k não saia do array
+
+        if idx_inicio_valido_no_vetor <= idx_fim_valido_para_loop_k : # Garante que há pelo menos um dia
+            for k in range(idx_inicio_valido_no_vetor, idx_fim_valido_para_loop_k + 1): # +1 para incluir o último dia
+                vetor_vf_arr[k] += fnvlrliber_arr[i]
+    return vetor_vf_arr
+
+@jit(nopython=True)
+def calcula_vetor_hedge_numba(vetor_vf_local, cobertura_hedge_local):
+    vetor_hedge_local = np.zeros_like(vetor_vf_local)
+    if len(vetor_vf_local) == 0:
+        return vetor_hedge_local
+    
+    primeiro_hedge = vetor_vf_local[0] * cobertura_hedge_local
+    vetor_hedge_local[0] = primeiro_hedge
+
+    for i in range(1, len(vetor_vf_local)):
+        hedge_do_dia = vetor_vf_local[i] * cobertura_hedge_local
+        hedge_anterior = vetor_hedge_local[i-1]
+        if hedge_do_dia > hedge_anterior:
+            vetor_hedge_local[i] = hedge_do_dia
+        else:
+            vetor_hedge_local[i] = hedge_anterior
+    return vetor_hedge_local
+
+# --- Função Principal ---
+def calcula_vertices_super_otimizado(df: pd.DataFrame, VERTICE, COBERTURA_HEDGE: float) -> pd.DataFrame:
+    df_vertice = df[df['DATA_VERTICE'] == VERTICE]
+
+    if df_vertice.empty:
+        return pd.DataFrame(columns=['DATA_POSICAO', 'VF', 'HEDGE', 'VALIDACAO'])
+
+    data_inicio = df_vertice['INICIO'].min()
+    # Ajuste data_fim conforme a necessidade exata
+    data_fim_max_original = df_vertice['FIM'].max()
+    data_fim_para_range = data_fim_max_original # Se o range deve incluir este dia
+
+    datas_range = pd.date_range(start=data_inicio, end=data_fim_para_range, freq='D')
+    
+    # Se datas_range estiver vazio (data_inicio > data_fim_para_range), retorne vazio
+    if datas_range.empty:
+        return pd.DataFrame(columns=['DATA_POSICAO', 'VF', 'HEDGE', 'VALIDACAO'])
+        
+    vetor_vf = np.zeros(len(datas_range), dtype='float32')
+
+    # Preparar arrays NumPy para Numba
+    inicios_np = (df_vertice['INICIO'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(np.int64) # Numba prefere tipos definidos como int64
+    fims_np = (df_vertice['FIM'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(np.int64)
+    fnvlrliber_np = df_vertice['FNVLRLIBER'].astype('float32').values
+
+    # Loop 1 com Numba
+    vetor_vf = preenche_vetor_vf_numba(vetor_vf, inicios_np, fims_np, fnvlrliber_np, len(df_vertice), len(datas_range))
+
+    # Loop 2 com Numba
+    vetor_hedge = calcula_vetor_hedge_numba(vetor_vf, float(COBERTURA_HEDGE)) # Garante que COBERTURA_HEDGE seja float para Numba
+
+    df_resultado = pd.DataFrame({'DATA_POSICAO': datas_range, 'VF': vetor_vf, 'HEDGE': vetor_hedge})
+    
+    # Lógica original de remoção da última linha (ajustar condição se necessário)
+    # Esta condição assume que a remoção só é desejada se o datas_range foi estendido artificialmente
+    # Se a intenção é sempre remover a última linha do range calculado, simplifique.
+    # A data_fim original era: df_vertice['FIM'].max().to_period('M').to_timestamp() + timedelta(days=1)
+    data_fim_original_sua_logica = df_vertice['FIM'].max().to_period('M').to_timestamp('D') + timedelta(days=1)
+    
+    if not df_resultado.empty:
+        if len(df_resultado) > 0 and data_fim_original_sua_logica == datas_range[-1]: # Compara com o que seria o dia "extra"
+             df_resultado = df_resultado.iloc[:-1]
+    
+    if not df_resultado.empty:
+        df_resultado['VALIDACAO'] = (df_resultado['VF'] < df_resultado['HEDGE']).astype('int32') # int32 é suficiente
+    else:
+        df_resultado['VALIDACAO'] = pd.Series(dtype='int32')
+
+    return df_resultado
