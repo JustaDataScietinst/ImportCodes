@@ -6,23 +6,31 @@ from numba import jit # Importar Numba
 # --- Funções compiladas com Numba ---
 @jit(nopython=True)
 def preenche_vetor_vf_numba(vetor_vf_arr, inicios_arr, fims_arr, fnvlrliber_arr, len_df_vertice, len_datas_range):
+    # O loop externo itera sobre as linhas de df_vertice (1M de linhas)
     for i in range(len_df_vertice):
-        idx_inicio_evento = inicios_arr[i]
-        idx_fim_evento = fims_arr[i] # Este é o índice do último dia a ser incluído
+        idx_inicio_evento_original = inicios_arr[i]
+        idx_fim_evento_original = fims_arr[i] # Este é o índice do último dia a ser INCLUÍDO
 
-        idx_inicio_valido_no_vetor = max(0, idx_inicio_evento)
-        # Para o slicing implícito no loop k, o fim é exclusivo.
-        # Se idx_fim_evento é o último dia, o loop k vai até idx_fim_evento.
-        idx_fim_valido_para_loop_k = min(len_datas_range -1 , idx_fim_evento) # Garante que k não saia do array
+        # Aplica max(0, ...) e min(len(datas_range) - 1, ...) como na sua lógica original
+        # para os índices que serão usados no vetor_vf_arr
+        idx_inicio_no_vetor = max(0, idx_inicio_evento_original)
+        
+        # O fim_idx no seu loop original era usado para o limite superior do slice,
+        # que é exclusivo. Então, se row['FIM'] é o último dia, precisamos de índice_do_FIM + 1.
+        # E então o min() é aplicado.
+        idx_fim_para_slice_no_vetor = min(len_datas_range, idx_fim_evento_original + 1)
 
-        if idx_inicio_valido_no_vetor <= idx_fim_valido_para_loop_k : # Garante que há pelo menos um dia
-            for k in range(idx_inicio_valido_no_vetor, idx_fim_valido_para_loop_k + 1): # +1 para incluir o último dia
+
+        # O loop interno simula o slicing: vetor_vf[idx_inicio_no_vetor : idx_fim_para_slice_no_vetor] += valor
+        # É importante que idx_inicio_no_vetor seja menor que idx_fim_para_slice_no_vetor
+        if idx_inicio_no_vetor < idx_fim_para_slice_no_vetor:
+            for k in range(idx_inicio_no_vetor, idx_fim_para_slice_no_vetor):
                 vetor_vf_arr[k] += fnvlrliber_arr[i]
     return vetor_vf_arr
 
 @jit(nopython=True)
 def calcula_vetor_hedge_numba(vetor_vf_local, cobertura_hedge_local):
-    vetor_hedge_local = np.zeros_like(vetor_vf_local)
+    vetor_hedge_local = np.zeros_like(vetor_vf_local) # dtype será o mesmo de vetor_vf_local
     if len(vetor_vf_local) == 0:
         return vetor_hedge_local
     
@@ -32,6 +40,7 @@ def calcula_vetor_hedge_numba(vetor_vf_local, cobertura_hedge_local):
     for i in range(1, len(vetor_vf_local)):
         hedge_do_dia = vetor_vf_local[i] * cobertura_hedge_local
         hedge_anterior = vetor_hedge_local[i-1]
+        # Replicando max(A, B)
         if hedge_do_dia > hedge_anterior:
             vetor_hedge_local[i] = hedge_do_dia
         else:
@@ -39,51 +48,53 @@ def calcula_vetor_hedge_numba(vetor_vf_local, cobertura_hedge_local):
     return vetor_hedge_local
 
 # --- Função Principal ---
-def calcula_vertices_super_otimizado(df: pd.DataFrame, VERTICE, COBERTURA_HEDGE: float) -> pd.DataFrame:
+def calcula_vertices_com_sua_logica_de_datas(df: pd.DataFrame, VERTICE, COBERTURA_HEDGE: float) -> pd.DataFrame:
     df_vertice = df[df['DATA_VERTICE'] == VERTICE]
 
     if df_vertice.empty:
         return pd.DataFrame(columns=['DATA_POSICAO', 'VF', 'HEDGE', 'VALIDACAO'])
 
+    # Mantendo SUA LÓGICA ORIGINAL para data_inicio e data_fim
     data_inicio = df_vertice['INICIO'].min()
-    # Ajuste data_fim conforme a necessidade exata
-    data_fim_max_original = df_vertice['FIM'].max()
-    data_fim_para_range = data_fim_max_original # Se o range deve incluir este dia
+    data_fim = df_vertice['FIM'].max().to_period('M').to_timestamp('D') + timedelta(days=1)
+    # O 'D' em to_timestamp('D') garante que o timestamp não tenha horas/minutos/segundos,
+    # o que pode afetar a comparação com datas_range[-1] se datas_range for apenas de datas.
+    # Se FIM já é apenas data, 'D' pode não ser necessário. Pandas geralmente lida bem.
 
-    datas_range = pd.date_range(start=data_inicio, end=data_fim_para_range, freq='D')
+    datas_range = pd.date_range(start=data_inicio, end=data_fim, freq='D')
     
-    # Se datas_range estiver vazio (data_inicio > data_fim_para_range), retorne vazio
-    if datas_range.empty:
+    if datas_range.empty: # Adicionado para segurança
         return pd.DataFrame(columns=['DATA_POSICAO', 'VF', 'HEDGE', 'VALIDACAO'])
         
     vetor_vf = np.zeros(len(datas_range), dtype='float32')
 
     # Preparar arrays NumPy para Numba
-    inicios_np = (df_vertice['INICIO'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(np.int64) # Numba prefere tipos definidos como int64
+    # Os índices devem ser relativos a 'data_inicio' do datas_range
+    inicios_np = (df_vertice['INICIO'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(np.int64)
+    # fims_np representa o índice do último dia do evento em relação a data_inicio
     fims_np = (df_vertice['FIM'].values - np.datetime64(data_inicio)).astype('timedelta64[D]').astype(np.int64)
     fnvlrliber_np = df_vertice['FNVLRLIBER'].astype('float32').values
 
-    # Loop 1 com Numba
+    # Loop 1 com Numba (preenche_vetor_vf_numba modificado para replicar o slicing)
     vetor_vf = preenche_vetor_vf_numba(vetor_vf, inicios_np, fims_np, fnvlrliber_np, len(df_vertice), len(datas_range))
-
+    
     # Loop 2 com Numba
-    vetor_hedge = calcula_vetor_hedge_numba(vetor_vf, float(COBERTURA_HEDGE)) # Garante que COBERTURA_HEDGE seja float para Numba
+    vetor_hedge = calcula_vetor_hedge_numba(vetor_vf, float(COBERTURA_HEDGE))
 
     df_resultado = pd.DataFrame({'DATA_POSICAO': datas_range, 'VF': vetor_vf, 'HEDGE': vetor_hedge})
     
-    # Lógica original de remoção da última linha (ajustar condição se necessário)
-    # Esta condição assume que a remoção só é desejada se o datas_range foi estendido artificialmente
-    # Se a intenção é sempre remover a última linha do range calculado, simplifique.
-    # A data_fim original era: df_vertice['FIM'].max().to_period('M').to_timestamp() + timedelta(days=1)
-    data_fim_original_sua_logica = df_vertice['FIM'].max().to_period('M').to_timestamp('D') + timedelta(days=1)
+    # Mantendo SUA LÓGICA ORIGINAL de remover a última linha
+    # Esta lógica assume que o 'data_fim' calculado resultou em um 'datas_range'
+    # que tem um dia a mais do que o desejado no df_resultado final.
+    if not df_resultado.empty: # Apenas tente fatiar se não estiver vazio
+        df_resultado = df_resultado.iloc[:-1] 
     
+    # Só adiciona 'VALIDACAO' se df_resultado não ficou vazio após o iloc
     if not df_resultado.empty:
-        if len(df_resultado) > 0 and data_fim_original_sua_logica == datas_range[-1]: # Compara com o que seria o dia "extra"
-             df_resultado = df_resultado.iloc[:-1]
-    
-    if not df_resultado.empty:
-        df_resultado['VALIDACAO'] = (df_resultado['VF'] < df_resultado['HEDGE']).astype('int32') # int32 é suficiente
+        df_resultado['VALIDACAO'] = (df_resultado['VF'] < df_resultado['HEDGE']).astype('int32')
     else:
-        df_resultado['VALIDACAO'] = pd.Series(dtype='int32')
+        # Se ficou vazio, mas ainda queremos a estrutura de colunas
+        df_resultado = pd.DataFrame(columns=['DATA_POSICAO', 'VF', 'HEDGE', 'VALIDACAO'])
+
 
     return df_resultado
