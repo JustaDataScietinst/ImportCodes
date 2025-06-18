@@ -1,0 +1,305 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit, StratifiedKFold, KFold, cross_validate
+from sklearn.preprocessing import LabelEncoder
+import warnings
+warnings.filterwarnings('ignore')
+
+def random_forest_feature_selector(df, target_col, model_type, time_series=False, 
+                                 lag_columns=None, n_lags=3, n_random_vars=10, 
+                                 random_state=42):
+    """
+    Função de feature selection usando Random Forest e variáveis aleatórias como benchmark.
+    
+    Parâmetros:
+    -----------
+    df : pandas.DataFrame
+        DataFrame com os dados
+    target_col : str
+        Nome da coluna target
+    model_type : str
+        'regression' ou 'classifier'
+    time_series : bool, default=False
+        Se True, usa TimeSeriesSplit para validação
+    lag_columns : list, default=None
+        Lista de colunas para criar lags. Se None, cria lags para todas as features numéricas
+    n_lags : int, default=3
+        Número de lags a serem criados
+    n_random_vars : int, default=10
+        Número de variáveis aleatórias a serem adicionadas
+    random_state : int, default=42
+        Seed para reprodutibilidade
+        
+    Retorna:
+    --------
+    tuple : (removed_features, kept_features)
+        - removed_features: lista de features removidas (nomes originais)
+        - kept_features: lista de features mantidas (nomes originais)
+    """
+    
+    # Validação dos parâmetros
+    if model_type not in ['regression', 'classifier']:
+        raise ValueError("model_type deve ser 'regression' ou 'classifier'")
+    
+    if target_col not in df.columns:
+        raise ValueError(f"Coluna target '{target_col}' não encontrada no DataFrame")
+    
+    # Preparar dados
+    df_work = df.copy()
+    np.random.seed(random_state)
+    
+    # Identificar colunas numéricas (excluindo target)
+    numeric_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+    
+    # Definir colunas para criar lags
+    if lag_columns is None:
+        lag_columns = numeric_cols
+    else:
+        # Verificar se as colunas especificadas existem
+        missing_cols = [col for col in lag_columns if col not in df_work.columns]
+        if missing_cols:
+            raise ValueError(f"Colunas não encontradas: {missing_cols}")
+    
+    print(f"Criando lags para {len(lag_columns)} variáveis...")
+    
+    # 1. Criar lags para as variáveis especificadas
+    original_features = lag_columns.copy()
+    
+    for col in lag_columns:
+        for lag in range(1, n_lags + 1):
+            lag_col_name = f"{col}_lag_{lag}"
+            df_work[lag_col_name] = df_work[col].shift(lag)
+    
+    # 2. Adicionar N variáveis aleatórias
+    print(f"Adicionando {n_random_vars} variáveis aleatórias...")
+    random_feature_names = []
+    
+    for i in range(n_random_vars):
+        random_col_name = f"random_var_{i+1}"
+        # Criar variáveis aleatórias com distribuição similar aos dados reais
+        df_work[random_col_name] = np.random.normal(0, 1, len(df_work))
+        random_feature_names.append(random_col_name)
+    
+    # Remover linhas com NaN (devido aos lags)
+    df_work = df_work.dropna()
+    
+    if len(df_work) == 0:
+        raise ValueError("Não restaram dados após remoção de NaN. Reduza o número de lags.")
+    
+    # Preparar features e target
+    feature_cols = [col for col in df_work.columns if col != target_col]
+    X = df_work[feature_cols]
+    y = df_work[target_col]
+    
+    # Preparar target para classificação se necessário
+    if model_type == 'classifier':
+        if y.dtype == 'object' or len(y.unique()) < 20:  # Heurística para categorical
+            le = LabelEncoder()
+            y = le.fit_transform(y)
+        else:
+            print("Aviso: Target parece ser contínuo, mas model_type é 'classifier'")
+    
+    # 3. Treinar modelo RandomForest com Cross-Validation
+    print(f"Treinando modelo Random Forest ({model_type}) com CV de 4 splits...")
+    
+    if model_type == 'regression':
+        rf_model = RandomForestRegressor(n_estimators=100, random_state=random_state, n_jobs=-1)
+    else:
+        rf_model = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=-1)
+    
+    # Definir estratégia de cross-validation com 4 splits
+    if time_series:
+        cv = TimeSeriesSplit(n_splits=4)
+        print("Usando TimeSeriesSplit com 4 splits...")
+    else:
+        if model_type == 'classifier':
+            cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=random_state)
+            print("Usando StratifiedKFold com 4 splits...")
+        else:
+            cv = KFold(n_splits=4, shuffle=True, random_state=random_state)
+            print("Usando KFold com 4 splits...")
+    
+    # Executar cross-validation para obter importâncias médias das features
+    feature_importances_cv = []
+    
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        print(f"  Processando fold {fold + 1}/4...")
+        
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        # Treinar modelo no fold
+        rf_model.fit(X_train, y_train)
+        
+        # Armazenar importâncias do fold
+        fold_importances = pd.DataFrame({
+            'feature': X.columns,
+            'importance': rf_model.feature_importances_,
+            'fold': fold + 1
+        })
+        feature_importances_cv.append(fold_importances)
+    
+    # Combinar importâncias de todos os folds
+    all_importances = pd.concat(feature_importances_cv, ignore_index=True)
+    
+    # Calcular importância média por feature
+    feature_importances = all_importances.groupby('feature')['importance'].agg([
+        'mean', 'std', 'min', 'max'
+    ]).reset_index()
+    
+    # Renomear coluna para compatibilidade
+    feature_importances = feature_importances.rename(columns={'mean': 'importance'})
+    
+    print(f"Cross-validation concluído. Importâncias calculadas com média de 4 folds.")
+    
+    # 4. Calcular média da importância das variáveis aleatórias
+    random_importances_df = feature_importances[
+        feature_importances['feature'].isin(random_feature_names)
+    ]
+    
+    random_importance_threshold = random_importances_df['importance'].mean()
+    print(f"Threshold de importância (média das aleatórias): {random_importance_threshold:.6f}")
+    print(f"Desvio padrão das aleatórias: {random_importances_df['std'].mean():.6f}")
+    
+    # 5. Analisar features originais e seus lags
+    removed_features = []
+    kept_features = []
+    
+    print("\nAnalisando features originais e seus lags...")
+    
+    for original_feature in original_features:
+        # Encontrar todas as variantes da feature (original + lags)
+        related_features = [original_feature]  # Feature original
+        related_features.extend([f"{original_feature}_lag_{i}" for i in range(1, n_lags + 1)])
+        
+        # Verificar se todas as variantes existem no DataFrame final
+        existing_related = [f for f in related_features if f in feature_importances['feature'].values]
+        
+        if not existing_related:
+            continue
+        
+        # Obter importâncias de todas as variantes
+        related_importances = feature_importances[
+            feature_importances['feature'].isin(existing_related)
+        ]['importance']
+        
+        # Verificar se TODAS as variantes têm importância menor que o threshold
+        all_below_threshold = all(imp < random_importance_threshold for imp in related_importances)
+        
+        if all_below_threshold:
+            removed_features.append(original_feature)
+            print(f"❌ Removida: {original_feature} (max importance: {related_importances.max():.6f} ± {feature_importances[feature_importances['feature'].isin(existing_related)]['std'].max():.6f})")
+        else:
+            kept_features.append(original_feature)
+            print(f"✅ Mantida: {original_feature} (max importance: {related_importances.max():.6f} ± {feature_importances[feature_importances['feature'].isin(existing_related)]['std'].max():.6f})")
+    
+    # 6. Remover features aleatórias (sempre removidas)
+    print(f"\nRemovendo {len(random_feature_names)} variáveis aleatórias...")
+    
+    # Estatísticas finais
+    print(f"\n=== RESUMO ===")
+    print(f"Features originais analisadas: {len(original_features)}")
+    print(f"Features removidas: {len(removed_features)}")
+    print(f"Features mantidas: {len(kept_features)}")
+    print(f"Taxa de redução: {len(removed_features)/len(original_features)*100:.1f}%")
+    
+    return removed_features, kept_features
+
+
+# Função auxiliar para visualizar os resultados
+def plot_feature_importance_analysis(df, target_col, model_type, time_series=False, 
+                                   lag_columns=None, n_lags=3, n_random_vars=10):
+    """
+    Função auxiliar para visualizar a análise de importância das features
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Executar a análise
+        removed, kept = random_forest_feature_selector(
+            df, target_col, model_type, time_series, lag_columns, n_lags, n_random_vars
+        )
+        
+        # Criar gráfico
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Gráfico 1: Features removidas vs mantidas
+        labels = ['Removidas', 'Mantidas']
+        sizes = [len(removed), len(kept)]
+        colors = ['#ff7f7f', '#7fbf7f']
+        
+        ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        ax1.set_title('Distribuição de Features: Removidas vs Mantidas')
+        
+        # Gráfico 2: Lista das features
+        y_pos = range(len(removed) + len(kept))
+        feature_names = removed + kept
+        colors_bar = ['red'] * len(removed) + ['green'] * len(kept)
+        
+        ax2.barh(y_pos, [1] * len(feature_names), color=colors_bar, alpha=0.7)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(feature_names)
+        ax2.set_xlabel('Status')
+        ax2.set_title('Features por Status')
+        ax2.set_xlim(0, 1.2)
+        
+        # Adicionar legendas
+        ax2.text(1.1, len(removed)/2, 'Removidas', rotation=90, va='center', color='red')
+        ax2.text(1.1, len(removed) + len(kept)/2, 'Mantidas', rotation=90, va='center', color='green')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return removed, kept
+        
+    except ImportError:
+        print("Matplotlib não disponível. Retornando apenas os resultados...")
+        return random_forest_feature_selector(
+            df, target_col, model_type, time_series, lag_columns, n_lags, n_random_vars
+        )
+
+
+# Exemplo de uso
+if __name__ == "__main__":
+    # Criar dados de exemplo
+    np.random.seed(42)
+    n_samples = 1000
+    
+    # Criar DataFrame de exemplo
+    data = {
+        'feature_1': np.random.normal(0, 1, n_samples),
+        'feature_2': np.random.normal(0, 1, n_samples),
+        'feature_3': np.random.normal(0, 1, n_samples),  # Feature irrelevante
+        'feature_4': np.random.normal(0, 1, n_samples),
+        'useful_feature': np.random.normal(0, 1, n_samples)
+    }
+    
+    df_example = pd.DataFrame(data)
+    
+    # Criar target baseado em algumas features (regressão)
+    df_example['target'] = (2 * df_example['feature_1'] + 
+                           1.5 * df_example['feature_2'] + 
+                           3 * df_example['useful_feature'] + 
+                           np.random.normal(0, 0.5, n_samples))
+    
+    print("=== EXEMPLO DE USO ===")
+    print("Executando feature selection em dados de exemplo...")
+    
+    # Executar feature selection
+    removed_features, kept_features = random_forest_feature_selector(
+        df=df_example,
+        target_col='target',
+        model_type='regression',
+        time_series=False,
+        lag_columns=['feature_1', 'feature_2', 'feature_3', 'feature_4', 'useful_feature'],
+        n_lags=2,
+        n_random_vars=5,
+        random_state=42
+    )
+    
+    print(f"\nFeatures removidas: {removed_features}")
+    print(f"Features mantidas: {kept_features}")
