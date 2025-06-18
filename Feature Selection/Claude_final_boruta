@@ -1,0 +1,452 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit, StratifiedKFold, KFold
+from sklearn.preprocessing import LabelEncoder
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+def boruta_feature_selector(df, target_col, model_type, time_series=False, 
+                          max_iter=100, alpha=0.05, random_state=42, 
+                          n_estimators=100, verbose=True):
+    """
+    Implementação do algoritmo Boruta para feature selection.
+    
+    O algoritmo Boruta cria shadow features (cópias aleatórias das features originais)
+    e compara a importância das features reais com suas versões embaralhadas.
+    Features que consistentemente superam suas shadow features são confirmadas.
+    
+    Parâmetros:
+    -----------
+    df : pandas.DataFrame
+        DataFrame com os dados
+    target_col : str
+        Nome da coluna target
+    model_type : str
+        'regression' ou 'classifier'
+    time_series : bool, default=False
+        Se True, usa TimeSeriesSplit para validação
+    max_iter : int, default=100
+        Número máximo de iterações do algoritmo
+    alpha : float, default=0.05
+        Nível de significância para o teste estatístico
+    random_state : int, default=42
+        Seed para reprodutibilidade
+    n_estimators : int, default=100
+        Número de árvores no Random Forest
+    verbose : bool, default=True
+        Se True, mostra progresso detalhado
+        
+    Retorna:
+    --------
+    dict : {
+        'confirmed': list,      # Features confirmadas como importantes
+        'rejected': list,       # Features rejeitadas como não importantes  
+        'tentative': list,      # Features inconclusivas
+        'iterations': int,      # Número de iterações executadas
+        'history': DataFrame    # Histórico das importâncias por iteração
+    }
+    """
+    
+    # Validações
+    if model_type not in ['regression', 'classifier']:
+        raise ValueError("model_type deve ser 'regression' ou 'classifier'")
+    
+    if target_col not in df.columns:
+        raise ValueError(f"Coluna target '{target_col}' não encontrada no DataFrame")
+    
+    if alpha <= 0 or alpha >= 1:
+        raise ValueError("alpha deve estar entre 0 e 1")
+    
+    # Preparar dados
+    df_work = df.copy().dropna()
+    
+    # Identificar features numéricas
+    numeric_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+    
+    if len(numeric_cols) == 0:
+        raise ValueError("Nenhuma feature numérica encontrada")
+    
+    X = df_work[numeric_cols]
+    y = df_work[target_col]
+    
+    # Preparar target para classificação
+    if model_type == 'classifier':
+        if y.dtype == 'object' or len(y.unique()) < 20:
+            le = LabelEncoder()
+            y = le.fit_transform(y)
+    
+    # Configurar modelo e CV
+    if model_type == 'regression':
+        rf_model = RandomForestRegressor(n_estimators=n_estimators, 
+                                       random_state=random_state, n_jobs=-1)
+    else:
+        rf_model = RandomForestClassifier(n_estimators=n_estimators, 
+                                        random_state=random_state, n_jobs=-1)
+    
+    # Definir estratégia de CV
+    if time_series:
+        cv = TimeSeriesSplit(n_splits=4)
+    else:
+        if model_type == 'classifier':
+            cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=random_state)
+        else:
+            cv = KFold(n_splits=4, shuffle=True, random_state=random_state)
+    
+    # Inicializar variáveis do algoritmo Boruta
+    n_features = len(numeric_cols)
+    feature_status = {col: 'tentative' for col in numeric_cols}  # tentative, confirmed, rejected
+    
+    # Histórico de importâncias
+    importance_history = []
+    
+    np.random.seed(random_state)
+    
+    if verbose:
+        print("=== INICIANDO ALGORITMO BORUTA ===")
+        print(f"Features iniciais: {n_features}")
+        print(f"Tipo de modelo: {model_type}")
+        print(f"Time series: {time_series}")
+        print(f"Alpha: {alpha}")
+        print(f"Max iterações: {max_iter}")
+        print("-" * 50)
+    
+    # ALGORITMO BORUTA
+    for iteration in range(max_iter):
+        if verbose:
+            print(f"\n--- ITERAÇÃO {iteration + 1}/{max_iter} ---")
+        
+        # 1. Criar shadow features (versões embaralhadas)
+        X_extended = X.copy()
+        shadow_features = []
+        
+        for col in X.columns:
+            if feature_status[col] == 'tentative':  # Só criar shadow para tentativas
+                shadow_col = f"shadow_{col}"
+                X_extended[shadow_col] = np.random.permutation(X[col].values)
+                shadow_features.append(shadow_col)
+        
+        if len(shadow_features) == 0:
+            if verbose:
+                print("Não há mais features tentativas. Finalizando...")
+            break
+        
+        if verbose:
+            print(f"Criadas {len(shadow_features)} shadow features")
+        
+        # 2. Treinar modelo com CV e calcular importâncias
+        feature_importances_cv = []
+        
+        for fold, (train_idx, val_idx) in enumerate(cv.split(X_extended, y)):
+            X_train = X_extended.iloc[train_idx]
+            y_train = y.iloc[train_idx]
+            
+            # Treinar modelo
+            rf_model.fit(X_train, y_train)
+            
+            # Armazenar importâncias
+            fold_importances = pd.DataFrame({
+                'feature': X_extended.columns,
+                'importance': rf_model.feature_importances_,
+                'fold': fold + 1,
+                'iteration': iteration + 1
+            })
+            feature_importances_cv.append(fold_importances)
+        
+        # Calcular importâncias médias
+        all_importances = pd.concat(feature_importances_cv, ignore_index=True)
+        mean_importances = all_importances.groupby('feature')['importance'].mean()
+        
+        # 3. Encontrar Z-score máximo das shadow features
+        shadow_importances = [mean_importances[sf] for sf in shadow_features]
+        max_shadow_importance = max(shadow_importances)
+        
+        if verbose:
+            print(f"Max shadow importance: {max_shadow_importance:.6f}")
+        
+        # 4. Teste estatístico para cada feature tentativa
+        decisions_made = 0
+        
+        for feature in X.columns:
+            if feature_status[feature] != 'tentative':
+                continue
+            
+            feature_importance = mean_importances[feature]
+            
+            # Coletar histórico de comparações desta feature vs shadows
+            feature_vs_shadow_history = []
+            
+            # Para ser mais robusto, usar teste de Wilcoxon
+            feature_scores = all_importances[all_importances['feature'] == feature]['importance'].values
+            shadow_scores = all_importances[all_importances['feature'].str.startswith('shadow_')]['importance'].values
+            
+            # Teste de hipótese: feature é melhor que shadows?
+            if len(feature_scores) > 1 and len(shadow_scores) > 1:
+                try:
+                    # Teste de Mann-Whitney U (alternativa não-paramétrica ao t-test)
+                    statistic, p_value = stats.mannwhitneyu(
+                        feature_scores, shadow_scores, alternative='greater'
+                    )
+                    
+                    # Decisão baseada no p-value
+                    if p_value < alpha:
+                        feature_status[feature] = 'confirmed'
+                        decisions_made += 1
+                        if verbose:
+                            print(f"✅ CONFIRMADA: {feature} (imp: {feature_importance:.6f}, p: {p_value:.4f})")
+                    
+                    elif p_value > (1 - alpha):  # Evidência forte de que é pior que shadow
+                        feature_status[feature] = 'rejected'
+                        decisions_made += 1
+                        if verbose:
+                            print(f"❌ REJEITADA: {feature} (imp: {feature_importance:.6f}, p: {p_value:.4f})")
+                    
+                    else:
+                        if verbose:
+                            print(f"⏳ TENTATIVA: {feature} (imp: {feature_importance:.6f}, p: {p_value:.4f})")
+                            
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️  Erro no teste para {feature}: {e}")
+            
+            else:
+                # Fallback: comparação simples se teste estatístico falhar
+                if feature_importance > max_shadow_importance:
+                    feature_status[feature] = 'confirmed'
+                    decisions_made += 1
+                    if verbose:
+                        print(f"✅ CONFIRMADA: {feature} (imp: {feature_importance:.6f} > {max_shadow_importance:.6f})")
+        
+        # Salvar histórico
+        iteration_history = {
+            'iteration': iteration + 1,
+            'max_shadow_importance': max_shadow_importance,
+            'decisions_made': decisions_made,
+            'confirmed_count': sum(1 for status in feature_status.values() if status == 'confirmed'),
+            'rejected_count': sum(1 for status in feature_status.values() if status == 'rejected'),
+            'tentative_count': sum(1 for status in feature_status.values() if status == 'tentative')
+        }
+        importance_history.append(iteration_history)
+        
+        if verbose:
+            print(f"Decisões nesta iteração: {decisions_made}")
+            print(f"Status atual - Confirmadas: {iteration_history['confirmed_count']}, "
+                  f"Rejeitadas: {iteration_history['rejected_count']}, "
+                  f"Tentativas: {iteration_history['tentative_count']}")
+        
+        # Verificar critério de parada
+        if iteration_history['tentative_count'] == 0:
+            if verbose:
+                print("\n🎉 Todas as features foram classificadas!")
+            break
+        
+        # Critério de parada por estagnação
+        if len(importance_history) >= 10:
+            recent_decisions = [h['decisions_made'] for h in importance_history[-5:]]
+            if sum(recent_decisions) == 0:
+                if verbose:
+                    print("\n⏹️ Stagnação detectada. Finalizando...")
+                break
+    
+    # Resultados finais
+    confirmed_features = [f for f, status in feature_status.items() if status == 'confirmed']
+    rejected_features = [f for f, status in feature_status.items() if status == 'rejected']
+    tentative_features = [f for f, status in feature_status.items() if status == 'tentative']
+    
+    if verbose:
+        print("\n" + "="*50)
+        print("=== RESULTADOS FINAIS DO BORUTA ===")
+        print(f"Iterações executadas: {iteration + 1}")
+        print(f"Features confirmadas: {len(confirmed_features)}")
+        print(f"Features rejeitadas: {len(rejected_features)}")
+        print(f"Features tentativas: {len(tentative_features)}")
+        print(f"Taxa de redução: {len(rejected_features)/n_features*100:.1f}%")
+        
+        if confirmed_features:
+            print(f"\n✅ CONFIRMADAS ({len(confirmed_features)}):")
+            for feature in sorted(confirmed_features):
+                print(f"  - {feature}")
+        
+        if rejected_features:
+            print(f"\n❌ REJEITADAS ({len(rejected_features)}):")
+            for feature in sorted(rejected_features):
+                print(f"  - {feature}")
+        
+        if tentative_features:
+            print(f"\n⏳ TENTATIVAS ({len(tentative_features)}):")
+            for feature in sorted(tentative_features):
+                print(f"  - {feature}")
+            print("  (Considere executar com mais iterações ou alpha diferente)")
+    
+    # Preparar DataFrame do histórico
+    history_df = pd.DataFrame(importance_history)
+    
+    return {
+        'confirmed': confirmed_features,
+        'rejected': rejected_features,
+        'tentative': tentative_features,
+        'iterations': iteration + 1,
+        'history': history_df,
+        'feature_status': feature_status
+    }
+
+
+def plot_boruta_results(boruta_results):
+    """
+    Função auxiliar para visualizar os resultados do Boruta
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        # Extrair dados
+        confirmed = boruta_results['confirmed']
+        rejected = boruta_results['rejected']
+        tentative = boruta_results['tentative']
+        history = boruta_results['history']
+        
+        # Criar figura com subplots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Gráfico de pizza - Distribuição final
+        labels = []
+        sizes = []
+        colors = []
+        
+        if len(confirmed) > 0:
+            labels.append(f'Confirmadas ({len(confirmed)})')
+            sizes.append(len(confirmed))
+            colors.append('#2ecc71')
+        
+        if len(rejected) > 0:
+            labels.append(f'Rejeitadas ({len(rejected)})')
+            sizes.append(len(rejected))
+            colors.append('#e74c3c')
+        
+        if len(tentative) > 0:
+            labels.append(f'Tentativas ({len(tentative)})')
+            sizes.append(len(tentative))
+            colors.append('#f39c12')
+        
+        ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        ax1.set_title('Distribuição Final das Features', fontsize=14, fontweight='bold')
+        
+        # 2. Evolução ao longo das iterações
+        if len(history) > 0:
+            ax2.plot(history['iteration'], history['confirmed_count'], 
+                    marker='o', color='#2ecc71', label='Confirmadas', linewidth=2)
+            ax2.plot(history['iteration'], history['rejected_count'], 
+                    marker='s', color='#e74c3c', label='Rejeitadas', linewidth=2)
+            ax2.plot(history['iteration'], history['tentative_count'], 
+                    marker='^', color='#f39c12', label='Tentativas', linewidth=2)
+            
+            ax2.set_xlabel('Iteração')
+            ax2.set_ylabel('Número de Features')
+            ax2.set_title('Evolução das Decisões', fontsize=14, fontweight='bold')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+        
+        # 3. Decisões por iteração
+        if len(history) > 0:
+            ax3.bar(history['iteration'], history['decisions_made'], 
+                   color='#3498db', alpha=0.7)
+            ax3.set_xlabel('Iteração')
+            ax3.set_ylabel('Decisões Tomadas')
+            ax3.set_title('Decisões por Iteração', fontsize=14, fontweight='bold')
+            ax3.grid(True, alpha=0.3)
+        
+        # 4. Lista de features por categoria
+        y_pos = 0
+        feature_names = []
+        feature_colors = []
+        
+        # Adicionar confirmadas
+        for feature in sorted(confirmed):
+            feature_names.append(feature)
+            feature_colors.append('#2ecc71')
+            y_pos += 1
+        
+        # Adicionar rejeitadas
+        for feature in sorted(rejected):
+            feature_names.append(feature)
+            feature_colors.append('#e74c3c')
+            y_pos += 1
+        
+        # Adicionar tentativas
+        for feature in sorted(tentative):
+            feature_names.append(feature)
+            feature_colors.append('#f39c12')
+            y_pos += 1
+        
+        if feature_names:
+            y_positions = range(len(feature_names))
+            ax4.barh(y_positions, [1] * len(feature_names), 
+                    color=feature_colors, alpha=0.7)
+            ax4.set_yticks(y_positions)
+            ax4.set_yticklabels(feature_names, fontsize=8)
+            ax4.set_xlabel('Status')
+            ax4.set_title('Features por Categoria', fontsize=14, fontweight='bold')
+            ax4.set_xlim(0, 1.2)
+        
+        plt.tight_layout()
+        plt.show()
+        
+    except ImportError:
+        print("Matplotlib não disponível para visualização.")
+    except Exception as e:
+        print(f"Erro na visualização: {e}")
+
+
+# Exemplo de uso
+if __name__ == "__main__":
+    # Criar dados de exemplo mais complexos
+    np.random.seed(42)
+    n_samples = 1000
+    
+    # Features com diferentes níveis de importância
+    data = {
+        'very_important': np.random.normal(0, 1, n_samples),
+        'moderately_important': np.random.normal(0, 1, n_samples),
+        'weakly_important': np.random.normal(0, 1, n_samples),
+        'noise_1': np.random.normal(0, 1, n_samples),
+        'noise_2': np.random.normal(0, 1, n_samples),
+        'noise_3': np.random.normal(0, 1, n_samples),
+        'correlated_noise': np.random.normal(0, 1, n_samples)
+    }
+    
+    df_example = pd.DataFrame(data)
+    
+    # Criar correlação artificial
+    df_example['correlated_noise'] = 0.3 * df_example['very_important'] + 0.7 * df_example['correlated_noise']
+    
+    # Target baseado apenas em algumas features
+    df_example['target'] = (
+        3.0 * df_example['very_important'] + 
+        1.5 * df_example['moderately_important'] + 
+        0.5 * df_example['weakly_important'] + 
+        np.random.normal(0, 0.5, n_samples)
+    )
+    
+    print("=== EXEMPLO DE USO DO BORUTA ===")
+    print("Executando Boruta em dados de exemplo...")
+    
+    # Executar Boruta
+    boruta_results = boruta_feature_selector(
+        df=df_example,
+        target_col='target',
+        model_type='regression',
+        time_series=False,
+        max_iter=50,
+        alpha=0.05,
+        random_state=42,
+        verbose=True
+    )
+    
+    # Mostrar resultados
+    print(f"\nRESUMO:")
+    print(f"Confirmadas: {boruta_results['confirmed']}")
+    print(f"Rejeitadas: {boruta_results['rejected']}")
+    print(f"Tentativas: {boruta_results['tentative']}")
