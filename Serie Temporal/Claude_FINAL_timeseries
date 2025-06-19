@@ -15,6 +15,7 @@ try:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
     from statsmodels.tsa.seasonal import seasonal_decompose
     from statsmodels.tsa.stattools import adfuller
+    from itertools import product
     HAS_STATSMODELS = True
 except ImportError:
     print("Aviso: statsmodels não encontrado. ARIMA e SARIMAX não estarão disponíveis.")
@@ -70,7 +71,7 @@ def time_series_forecast_comparison(df, target_col, date_col=None,
     """
     
     # Algoritmos disponíveis
-    available_algorithms = ['ElasticNet', 'XGBoost', 'LightGBM']
+    available_algorithms = ['ElasticNet', 'XGBoost', 'XGBoost_Linear', 'LightGBM', 'LightGBM_Linear']
     if HAS_STATSMODELS:
         available_algorithms.extend(['ARIMA', 'SARIMAX'])
     
@@ -207,10 +208,16 @@ def time_series_forecast_comparison(df, target_col, date_col=None,
                 model, pred = _train_elasticnet(X_train, y_train, X_test, y_test, tscv, verbose)
             
             elif algorithm == 'XGBoost':
-                model, pred = _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose)
+                model, pred = _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose, booster='gbtree')
+            
+            elif algorithm == 'XGBoost_Linear':
+                model, pred = _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose, booster='gblinear')
             
             elif algorithm == 'LightGBM':
-                model, pred = _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose)
+                model, pred = _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose, boosting_type='gbdt')
+            
+            elif algorithm == 'LightGBM_Linear':
+                model, pred = _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose, boosting_type='dart')
             
             elif algorithm == 'ARIMA' and HAS_STATSMODELS:
                 model, pred = _train_arima(y_train, y_test, seasonal_periods, verbose)
@@ -334,17 +341,35 @@ def _train_elasticnet(X_train, y_train, X_test, y_test, tscv, verbose):
     return grid_search, pred
 
 
-def _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose):
-    """Treina XGBoost com grid search"""
+def _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose, booster='gbtree'):
+    """Treina XGBoost com grid search e suporte a booster linear"""
     
-    param_grid = {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'subsample': [0.8, 0.9, 1.0]
-    }
+    if booster == 'gbtree':
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.1, 0.2],
+            'subsample': [0.8, 0.9, 1.0],
+            'colsample_bytree': [0.8, 0.9, 1.0],
+            'reg_alpha': [0, 0.1, 1],  # L1 regularization
+            'reg_lambda': [1, 1.5, 2]  # L2 regularization
+        }
+    else:  # gblinear
+        param_grid = {
+            'n_estimators': [100, 200, 500],
+            'learning_rate': [0.01, 0.1, 0.3],
+            'reg_alpha': [0, 0.1, 0.5, 1.0],  # L1 regularization
+            'reg_lambda': [0.1, 1.0, 2.0, 5.0],  # L2 regularization
+            'feature_selector': ['cyclic', 'shuffle']  # Feature selection for linear booster
+        }
     
-    xgb_model = xgb.XGBRegressor(random_state=42, n_jobs=-1)
+    xgb_model = xgb.XGBRegressor(
+        booster=booster, 
+        random_state=42, 
+        n_jobs=-1,
+        tree_method='hist' if booster == 'gbtree' else None
+    )
+    
     grid_search = GridSearchCV(
         xgb_model, param_grid, cv=tscv,
         scoring='neg_mean_squared_error', n_jobs=-1
@@ -353,6 +378,7 @@ def _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose):
     grid_search.fit(X_train, y_train)
     
     if verbose:
+        print(f"Booster: {booster}")
         print(f"Melhores params: {grid_search.best_params_}")
     
     pred = grid_search.predict(X_test)
@@ -360,17 +386,41 @@ def _train_xgboost(X_train, y_train, X_test, y_test, tscv, verbose):
     return grid_search, pred
 
 
-def _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose):
-    """Treina LightGBM com grid search"""
+def _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose, boosting_type='gbdt'):
+    """Treina LightGBM com grid search e diferentes boosting types"""
     
-    param_grid = {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'num_leaves': [15, 31, 63]
-    }
+    if boosting_type == 'gbdt':
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [3, 5, 7, -1],  # -1 significa sem limite
+            'learning_rate': [0.01, 0.1, 0.2],
+            'num_leaves': [15, 31, 63],
+            'subsample': [0.8, 0.9, 1.0],
+            'colsample_bytree': [0.8, 0.9, 1.0],
+            'reg_alpha': [0, 0.1, 1],  # L1 regularization
+            'reg_lambda': [0, 0.1, 1],  # L2 regularization
+            'min_child_samples': [10, 20, 30]
+        }
+    else:  # dart (Dropouts meet Multiple Additive Regression Trees)
+        param_grid = {
+            'n_estimators': [100, 200, 300],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.1, 0.2],
+            'num_leaves': [15, 31, 63],
+            'drop_rate': [0.1, 0.15, 0.2],  # Dropout rate for DART
+            'skip_drop': [0.3, 0.5, 0.7],   # Probability of skipping dropout
+            'reg_alpha': [0, 0.1, 1],
+            'reg_lambda': [0, 0.1, 1]
+        }
     
-    lgb_model = lgb.LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1)
+    lgb_model = lgb.LGBMRegressor(
+        boosting_type=boosting_type,
+        random_state=42, 
+        n_jobs=-1, 
+        verbose=-1,
+        force_col_wise=True  # Otimização para datasets pequenos
+    )
+    
     grid_search = GridSearchCV(
         lgb_model, param_grid, cv=tscv,
         scoring='neg_mean_squared_error', n_jobs=-1
@@ -379,6 +429,7 @@ def _train_lightgbm(X_train, y_train, X_test, y_test, tscv, verbose):
     grid_search.fit(X_train, y_train)
     
     if verbose:
+        print(f"Boosting type: {boosting_type}")
         print(f"Melhores params: {grid_search.best_params_}")
     
     pred = grid_search.predict(X_test)
@@ -432,7 +483,7 @@ def _train_arima(y_train, y_test, seasonal_periods, verbose):
 
 
 def _train_sarimax(y_train, y_test, exog_train, exog_test, seasonal_periods, verbose):
-    """Treina SARIMAX com busca de parâmetros"""
+    """Treina SARIMAX com busca extensiva de hiperparâmetros"""
     
     if not HAS_STATSMODELS:
         raise ImportError("statsmodels não está disponível")
@@ -441,32 +492,102 @@ def _train_sarimax(y_train, y_test, exog_train, exog_test, seasonal_periods, ver
     if seasonal_periods is None:
         seasonal_periods = 12  # Default mensal
     
-    # Configuração básica SARIMAX
+    # Grid de parâmetros para busca extensiva
+    p_values = range(0, 3)
+    d_values = range(0, 2)
+    q_values = range(0, 3)
+    P_values = range(0, 2)  # Parâmetros sazonais
+    D_values = range(0, 2)
+    Q_values = range(0, 2)
+    
+    best_aic = float('inf')
+    best_model = None
+    best_order = None
+    best_seasonal_order = None
+    
+    total_combinations = len(p_values) * len(d_values) * len(q_values) * len(P_values) * len(D_values) * len(Q_values)
+    
+    if verbose:
+        print(f"Testando {total_combinations} combinações de parâmetros SARIMAX...")
+    
+    tested_count = 0
+    
+    for p, d, q in product(p_values, d_values, q_values):
+        for P, D, Q in product(P_values, D_values, Q_values):
+            try:
+                # Evitar configurações muito complexas
+                if p + d + q + P + D + Q > 6:
+                    continue
+                    
+                model = SARIMAX(
+                    y_train,
+                    exog=exog_train,
+                    order=(p, d, q),
+                    seasonal_order=(P, D, Q, seasonal_periods),
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                    simple_differencing=True  # Melhora performance
+                )
+                
+                fitted_model = model.fit(
+                    disp=False, 
+                    maxiter=100,  # Limitar iterações para velocidade
+                    method='lbfgs'  # Método de otimização mais rápido
+                )
+                
+                if fitted_model.aic < best_aic:
+                    best_aic = fitted_model.aic
+                    best_model = fitted_model
+                    best_order = (p, d, q)
+                    best_seasonal_order = (P, D, Q, seasonal_periods)
+                
+                tested_count += 1
+                
+                # Progress feedback
+                if verbose and tested_count % 20 == 0:
+                    print(f"Testado {tested_count} modelos. Melhor AIC até agora: {best_aic:.2f}")
+                    
+            except Exception as e:
+                continue
+    
+    # Se nenhum modelo funcionou, usar configuração simples
+    if best_model is None:
+        try:
+            model = SARIMAX(
+                y_train,
+                exog=exog_train,
+                order=(1, 1, 1),
+                seasonal_order=(1, 1, 1, seasonal_periods),
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+            best_model = model.fit(disp=False)
+            best_order = (1, 1, 1)
+            best_seasonal_order = (1, 1, 1, seasonal_periods)
+            best_aic = best_model.aic
+            
+        except Exception as e:
+            # Último fallback: ARIMA simples
+            if verbose:
+                print(f"SARIMAX falhou completamente, usando ARIMA: {e}")
+            return _train_arima(y_train, y_test, seasonal_periods, verbose)
+    
+    if verbose:
+        print(f"Melhor configuração SARIMAX:")
+        print(f"  Ordem: {best_order}")
+        print(f"  Ordem sazonal: {best_seasonal_order}")
+        print(f"  AIC: {best_aic:.2f}")
+        print(f"  Modelos testados: {tested_count}")
+    
+    # Previsão
     try:
-        model = SARIMAX(
-            y_train,
-            exog=exog_train,
-            order=(1, 1, 1),
-            seasonal_order=(1, 1, 1, seasonal_periods),
-            enforce_stationarity=False,
-            enforce_invertibility=False
-        )
-        
-        fitted_model = model.fit(disp=False)
-        
-        if verbose:
-            print(f"SARIMAX (1,1,1)(1,1,1,{seasonal_periods}) treinado")
-        
-        # Previsão
-        forecast = fitted_model.forecast(steps=len(y_test), exog=exog_test)
-        
-        return fitted_model, forecast
-        
-    except Exception as e:
-        # Fallback para ARIMA simples
-        if verbose:
-            print(f"SARIMAX falhou, usando ARIMA: {e}")
-        return _train_arima(y_train, y_test, seasonal_periods, verbose)
+        forecast = best_model.forecast(steps=len(y_test), exog=exog_test)
+    except:
+        # Se falhar na previsão, usar get_forecast
+        forecast_result = best_model.get_forecast(steps=len(y_test), exog=exog_test)
+        forecast = forecast_result.predicted_mean
+    
+    return best_model, forecast
 
 
 def _calculate_direction_accuracy(y_true, y_pred):
@@ -554,40 +675,216 @@ def plot_forecast_comparison(comparison_results):
         print(f"Erro na visualização: {e}")
 
 
-# Exemplo de uso
-if __name__ == "__main__":
-    # Criar série temporal de exemplo
-    np.random.seed(42)
-    dates = pd.date_range('2020-01-01', periods=100, freq='M')
+def analyze_feature_importance(comparison_results, top_n=15):
+    """
+    Analisa a importância das features para modelos que suportam
+    """
     
-    # Série com tendência e sazonalidade
-    trend = np.linspace(100, 200, 100)
-    seasonal = 10 * np.sin(2 * np.pi * np.arange(100) / 12)
-    noise = np.random.normal(0, 5, 100)
+    models = comparison_results['models']
+    results = []
+    
+    for model_name, model in models.items():
+        try:
+            if model_name in ['XGBoost', 'XGBoost_Linear']:
+                # Para XGBoost
+                if hasattr(model, 'best_estimator_'):
+                    importance = model.best_estimator_.feature_importances_
+                    feature_names = comparison_results['data_info']['feature_names']
+                else:
+                    importance = model.feature_importances_
+                    feature_names = comparison_results['data_info']['feature_names']
+                
+                importance_df = pd.DataFrame({
+                    'feature': feature_names,
+                    'importance': importance,
+                    'model': model_name
+                }).sort_values('importance', ascending=False)
+                
+                results.append(importance_df.head(top_n))
+                
+            elif model_name in ['LightGBM', 'LightGBM_Linear']:
+                # Para LightGBM
+                if hasattr(model, 'best_estimator_'):
+                    importance = model.best_estimator_.feature_importances_
+                    feature_names = comparison_results['data_info']['feature_names']
+                else:
+                    importance = model.feature_importances_
+                    feature_names = comparison_results['data_info']['feature_names']
+                
+                importance_df = pd.DataFrame({
+                    'feature': feature_names,
+                    'importance': importance,
+                    'model': model_name
+                }).sort_values('importance', ascending=False)
+                
+                results.append(importance_df.head(top_n))
+                
+        except Exception as e:
+            print(f"Erro ao extrair importância para {model_name}: {e}")
+            continue
+    
+    if results:
+        combined_importance = pd.concat(results, ignore_index=True)
+        return combined_importance
+    else:
+        print("Nenhum modelo com importância de features disponível")
+        return None
+
+
+def create_ensemble_prediction(comparison_results, method='weighted_avg', weights=None):
+    """
+    Cria previsão ensemble baseada nos melhores modelos
+    
+    Parâmetros:
+    -----------
+    comparison_results : dict
+        Resultados da comparação de modelos
+    method : str
+        Método de ensemble ('weighted_avg', 'simple_avg', 'best_n')
+    weights : dict
+        Pesos para cada modelo (apenas para weighted_avg)
+    """
+    
+    predictions = comparison_results['predictions']
+    results_df = comparison_results['results']
+    y_test = comparison_results['test_data']['y_true']
+    
+    if method == 'simple_avg':
+        # Média simples de todas as previsões
+        pred_values = np.array(list(predictions.values()))
+        ensemble_pred = np.mean(pred_values, axis=0)
+        
+    elif method == 'weighted_avg':
+        # Média ponderada baseada no RMSE (menor RMSE = maior peso)
+        if weights is None:
+            # Calcular pesos automaticamente baseado no RMSE inverso
+            rmse_values = results_df.set_index('Algorithm')['RMSE']
+            weights = {}
+            for algo in predictions.keys():
+                if algo in rmse_values.index:
+                    weights[algo] = 1 / rmse_values[algo]
+        
+        # Normalizar pesos
+        total_weight = sum(weights.values())
+        weights = {k: v/total_weight for k, v in weights.items()}
+        
+        ensemble_pred = np.zeros(len(y_test))
+        for algo, pred in predictions.items():
+            if algo in weights:
+                ensemble_pred += weights[algo] * pred
+                
+    elif method == 'best_n':
+        # Média dos N melhores modelos
+        n_best = min(3, len(predictions))
+        best_models = results_df.head(n_best)['Algorithm'].tolist()
+        
+        selected_preds = [predictions[model] for model in best_models if model in predictions]
+        ensemble_pred = np.mean(selected_preds, axis=0)
+    
+    # Calcular métricas do ensemble
+    mae = mean_absolute_error(y_test, ensemble_pred)
+    mse = mean_squared_error(y_test, ensemble_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_test, ensemble_pred) * 100
+    direction_accuracy = _calculate_direction_accuracy(y_test, ensemble_pred)
+    
+    ensemble_results = {
+        'predictions': ensemble_pred,
+        'metrics': {
+            'MAE': mae,
+            'MSE': mse,
+            'RMSE': rmse,
+            'MAPE': mape,
+            'Direction_Accuracy': direction_accuracy,
+            'R2_Score': 1 - (mse / np.var(y_test))
+        },
+        'method': method,
+        'weights': weights if method == 'weighted_avg' else None
+    }
+    
+    return ensemble_results
+
+
+# Exemplo de uso melhorado
+if __name__ == "__main__":
+    # Criar série temporal de exemplo mais complexa
+    np.random.seed(42)
+    dates = pd.date_range('2020-01-01', periods=120, freq='M')  # 10 anos de dados mensais
+    
+    # Série com múltiplos componentes
+    t = np.arange(120)
+    trend = 100 + 0.5 * t  # Tendência crescente
+    seasonal_12 = 15 * np.sin(2 * np.pi * t / 12)  # Sazonalidade anual
+    seasonal_3 = 5 * np.sin(2 * np.pi * t / 3)   # Sazonalidade trimestral
+    noise = np.random.normal(0, 8, 120)
+    
+    # Variável target
+    sales = trend + seasonal_12 + seasonal_3 + noise
+    
+    # Variáveis exógenas
+    external_factor1 = 50 + 10 * np.sin(2 * np.pi * t / 12) + np.random.normal(0, 5, 120)
+    external_factor2 = np.random.normal(30, 8, 120)
+    marketing_spend = 100 + 20 * (t / 120) + np.random.normal(0, 15, 120)
     
     ts_data = pd.DataFrame({
         'date': dates,
-        'sales': trend + seasonal + noise,
-        'external_factor': np.random.normal(50, 10, 100)
+        'sales': sales,
+        'economic_indicator': external_factor1,
+        'competitor_price': external_factor2,
+        'marketing_spend': marketing_spend
     })
     
-    print("=== EXEMPLO DE USO ===")
-    print("Testando algoritmos em série temporal sintética...")
+    print("=== EXEMPLO APRIMORADO DE USO ===")
+    print("Testando algoritmos com busca de hiperparâmetros melhorada...")
+    print(f"Dados: {len(ts_data)} observações mensais")
+    print(f"Período: {ts_data['date'].min()} até {ts_data['date'].max()}")
     
-    # Executar comparação
+    # Executar comparação completa
     results = time_series_forecast_comparison(
         df=ts_data,
         target_col='sales',
         date_col='date',
-        test_size=0.2,
-        n_lags=6,
-        external_features=['external_factor'],
-        seasonal_periods=12,
-        algorithms=['ElasticNet', 'XGBoost', 'LightGBM'],  # Excluindo ARIMA para exemplo
-        cv_folds=3,
+        test_size=0.25,  # 25% para teste (30 meses)
+        n_lags=12,       # 12 lags (1 ano)
+        external_features=['economic_indicator', 'competitor_price', 'marketing_spend'],
+        seasonal_periods=12,  # Sazonalidade anual
+        algorithms=['ElasticNet', 'XGBoost', 'XGBoost_Linear', 'LightGBM', 'LightGBM_Linear', 'SARIMAX'],
+        cv_folds=5,
         verbose=True
     )
     
-    print(f"\nMelhor modelo: {results['best_model']}")
-    print("\nResultados detalhados:")
-    print(results['results'])
+    print(f"\n🏆 MELHOR MODELO: {results['best_model']}")
+    print("\n📊 RESULTADOS DETALHADOS:")
+    print(results['results'].round(4))
+    
+    # Análise de importância das features
+    print("\n🔍 ANÁLISE DE IMPORTÂNCIA DAS FEATURES:")
+    importance_analysis = analyze_feature_importance(results, top_n=10)
+    if importance_analysis is not None:
+        print(importance_analysis)
+    
+    # Criar ensemble
+    print("\n🎯 CRIANDO ENSEMBLE DOS MELHORES MODELOS:")
+    ensemble_results = create_ensemble_prediction(results, method='best_n')
+    
+    print(f"RMSE Ensemble: {ensemble_results['metrics']['RMSE']:.4f}")
+    print(f"MAPE Ensemble: {ensemble_results['metrics']['MAPE']:.2f}%")
+    print(f"Direction Accuracy Ensemble: {ensemble_results['metrics']['Direction_Accuracy']:.2f}%")
+    
+    # Comparar ensemble com melhor modelo individual
+    best_individual_rmse = results['results'].iloc[0]['RMSE']
+    ensemble_rmse = ensemble_results['metrics']['RMSE']
+    
+    if ensemble_rmse < best_individual_rmse:
+        improvement = ((best_individual_rmse - ensemble_rmse) / best_individual_rmse) * 100
+        print(f"✅ Ensemble melhorou RMSE em {improvement:.2f}%")
+    else:
+        degradation = ((ensemble_rmse - best_individual_rmse) / best_individual_rmse) * 100
+        print(f"⚠️ Ensemble degradou RMSE em {degradation:.2f}%")
+    
+    print("\n💡 DICAS:")
+    print("- Use plot_forecast_comparison(results) para visualizar os resultados")
+    print("- Experimente diferentes métodos de ensemble")
+    print("- Ajuste seasonal_periods conforme sua série (12=mensal, 4=trimestral, 52=semanal)")
+    print("- Para séries longas, considere aumentar n_lags")
+    print("- Modelos lineares (XGBoost_Linear, LightGBM_Linear) podem funcionar melhor para séries mais lineares")
