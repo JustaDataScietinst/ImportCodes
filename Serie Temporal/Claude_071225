@@ -1,0 +1,1052 @@
+"""
+Sistema de Forecasting para Carteira de Poupança
+Autor: Data Science Team
+Descrição: Framework profissional para previsão de 12 meses à frente
+"""
+
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import ElasticNet
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, mean_absolute_error
+
+import lightgbm as lgb
+import xgboost as xgb
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+import optuna
+from boruta import BorutaPy
+from sklearn.ensemble import RandomForestRegressor
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+
+# Configurações
+sns.set_style('whitegrid')
+plt.rcParams['figure.figsize'] = (15, 8)
+RANDOM_STATE = 42
+N_FOLDS = 4
+FORECAST_HORIZON = 12
+
+# ============================================================================
+# 1. GERAÇÃO DE DADOS SINTÉTICOS
+# ============================================================================
+
+def gerar_dados_sinteticos():
+    """
+    Gera dados sintéticos realistas para a carteira de poupança e variáveis macro
+    """
+    np.random.seed(RANDOM_STATE)
+    
+    # Período: Jan/2014 a Nov/2025
+    dates = pd.date_range(start='2014-01-01', end='2025-11-01', freq='MS')
+    n = len(dates)
+    
+    # Tendência + Sazonalidade + Ruído
+    trend = np.linspace(1_000_000, 8_000_000, n)
+    seasonality = 500_000 * np.sin(2 * np.pi * np.arange(n) / 12)
+    noise = np.random.normal(0, 100_000, n)
+    valor_total = trend + seasonality + noise
+    valor_total = np.maximum(valor_total, 500_000)  # Garantir valores positivos
+    
+    # Variáveis macroeconômicas realistas
+    selic = 13.75 + 2 * np.sin(2 * np.pi * np.arange(n) / 24) + np.random.normal(0, 0.5, n)
+    selic = np.clip(selic, 2, 20)
+    
+    ipca = 4.5 + 1.5 * np.sin(2 * np.pi * np.arange(n) / 12) + np.random.normal(0, 0.3, n)
+    ipca = np.clip(ipca, 0, 12)
+    
+    cambio = 3.5 + 1.5 * np.sin(2 * np.pi * np.arange(n) / 36) + np.random.normal(0, 0.2, n)
+    cambio = np.clip(cambio, 1.5, 6)
+    
+    pib = 2.0 + np.sin(2 * np.pi * np.arange(n) / 12) + np.random.normal(0, 0.5, n)
+    
+    df = pd.DataFrame({
+        'DATA': dates,
+        'VALOR_TOTAL': valor_total,
+        'SELIC': selic,
+        'IPCA': ipca,
+        'CAMBIO': cambio,
+        'PIB': pib
+    })
+    
+    return df
+
+# ============================================================================
+# 2. FEATURE ENGINEERING
+# ============================================================================
+
+def criar_features_temporais(df):
+    """
+    Cria features temporais e de sazonalidade
+    """
+    df = df.copy()
+    df['DATA'] = pd.to_datetime(df['DATA'])
+    df = df.sort_values('DATA').reset_index(drop=True)
+    
+    # Features temporais
+    df['ANO'] = df['DATA'].dt.year
+    df['MES'] = df['DATA'].dt.month
+    df['TRIMESTRE'] = df['DATA'].dt.quarter
+    df['DIA_ANO'] = df['DATA'].dt.dayofyear
+    df['SEMESTRE'] = (df['MES'] - 1) // 6 + 1
+    
+    # Features cíclicas para capturar sazonalidade
+    df['MES_SIN'] = np.sin(2 * np.pi * df['MES'] / 12)
+    df['MES_COS'] = np.cos(2 * np.pi * df['MES'] / 12)
+    df['TRIM_SIN'] = np.sin(2 * np.pi * df['TRIMESTRE'] / 4)
+    df['TRIM_COS'] = np.cos(2 * np.pi * df['TRIMESTRE'] / 4)
+    
+    # Índice temporal
+    df['IDX_TEMPO'] = np.arange(len(df))
+    
+    return df
+
+def criar_lags_e_features(df, target_col, n_lags=6):
+    """
+    Cria lags e features derivadas, garantindo não haver data leakage
+    """
+    df = df.copy()
+    
+    # Lags da variável target
+    for lag in range(1, n_lags + 1):
+        df[f'{target_col}_LAG_{lag}'] = df[target_col].shift(lag)
+    
+    # Lags das variáveis macro
+    macro_vars = ['SELIC', 'IPCA', 'CAMBIO', 'PIB']
+    for var in macro_vars:
+        if var in df.columns:
+            for lag in range(1, n_lags + 1):
+                df[f'{var}_LAG_{lag}'] = df[var].shift(lag)
+    
+    # Features de variação (diff)
+    df[f'{target_col}_DIFF_1'] = df[target_col].diff(1)
+    df[f'{target_col}_DIFF_12'] = df[target_col].diff(12)
+    
+    # Médias móveis
+    df[f'{target_col}_MA_3'] = df[target_col].shift(1).rolling(window=3, min_periods=1).mean()
+    df[f'{target_col}_MA_6'] = df[target_col].shift(1).rolling(window=6, min_periods=1).mean()
+    df[f'{target_col}_MA_12'] = df[target_col].shift(1).rolling(window=12, min_periods=1).mean()
+    
+    # Estatísticas móveis
+    df[f'{target_col}_STD_6'] = df[target_col].shift(1).rolling(window=6, min_periods=1).std()
+    df[f'{target_col}_MAX_6'] = df[target_col].shift(1).rolling(window=6, min_periods=1).max()
+    df[f'{target_col}_MIN_6'] = df[target_col].shift(1).rolling(window=6, min_periods=1).min()
+    
+    return df
+
+def criar_incremento_mensal(df, target_col='VALOR_TOTAL'):
+    """
+    Cria a variável de incremento mensal
+    """
+    df = df.copy()
+    df['INCREMENTO'] = df[target_col].diff(1)
+    return df
+
+# ============================================================================
+# 3. PREPARAÇÃO DOS DADOS
+# ============================================================================
+
+def preparar_dados(df, target_col, usar_log=False):
+    """
+    Prepara dados para modelagem, garantindo ausência de data leakage
+    """
+    df = df.copy()
+    
+    # Se o target for INCREMENTO, criar primeiro antes dos lags
+    if target_col == 'INCREMENTO':
+        df = criar_incremento_mensal(df, 'VALOR_TOTAL')
+    
+    # Aplicar log se necessário
+    if usar_log and target_col in df.columns:
+        df[f'{target_col}_ORIGINAL'] = df[target_col].copy()
+        df[target_col] = np.log1p(df[target_col])
+    
+    # Criar features
+    df = criar_features_temporais(df)
+    df = criar_lags_e_features(df, target_col)
+    
+    # Se target não for INCREMENTO, criar agora
+    if target_col != 'INCREMENTO':
+        df = criar_incremento_mensal(df, target_col)
+    
+    # Remover linhas com NaN (causadas pelos lags)
+    df_clean = df.dropna().reset_index(drop=True)
+    
+    return df_clean
+
+def separar_features_target(df, target_col):
+    """
+    Separa features e target, excluindo colunas não utilizáveis
+    """
+    # Colunas a excluir
+    exclude_cols = ['DATA', target_col]
+    if f'{target_col}_ORIGINAL' in df.columns:
+        exclude_cols.append(f'{target_col}_ORIGINAL')
+    
+    # Se target é INCREMENTO, excluir VALOR_TOTAL para evitar data leakage
+    if target_col == 'INCREMENTO':
+        if 'VALOR_TOTAL' in df.columns:
+            exclude_cols.append('VALOR_TOTAL')
+        if 'VALOR_TOTAL_ORIGINAL' in df.columns:
+            exclude_cols.append('VALOR_TOTAL_ORIGINAL')
+    # Se target é VALOR_TOTAL, excluir INCREMENTO
+    elif 'INCREMENTO' in df.columns and target_col != 'INCREMENTO':
+        exclude_cols.append('INCREMENTO')
+    
+    feature_cols = [col for col in df.columns if col not in exclude_cols]
+    
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+    
+    return X, y, feature_cols
+
+# ============================================================================
+# 4. FEATURE SELECTION COM BORUTA
+# ============================================================================
+
+def selecionar_features_boruta(X, y, max_iter=100, verbose=0):
+    """
+    Seleciona features relevantes usando Boruta
+    """
+    print("Iniciando seleção de features com Boruta...")
+    
+    # Modelo base para Boruta
+    rf = RandomForestRegressor(n_estimators=100, max_depth=7, random_state=RANDOM_STATE, n_jobs=-1)
+    
+    # Boruta
+    boruta = BorutaPy(
+        estimator=rf,
+        n_estimators='auto',
+        max_iter=max_iter,
+        random_state=RANDOM_STATE,
+        verbose=verbose
+    )
+    
+    boruta.fit(X.values, y.values)
+    
+    # Features selecionadas
+    selected_features = X.columns[boruta.support_].tolist()
+    
+    print(f"Features selecionadas: {len(selected_features)} de {X.shape[1]}")
+    
+    return selected_features, boruta
+
+# ============================================================================
+# 5. MÉTRICAS DE AVALIAÇÃO
+# ============================================================================
+
+def calcular_metricas(y_true, y_pred):
+    """
+    Calcula métricas de performance
+    """
+    mape = mean_absolute_percentage_error(y_true, y_pred) * 100
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    
+    return {
+        'MAPE': mape,
+        'RMSE': rmse,
+        'MAE': mae
+    }
+
+# ============================================================================
+# 6. MODELOS DE ML
+# ============================================================================
+
+def treinar_lightgbm(X_train, y_train, params=None):
+    """
+    Treina modelo LightGBM
+    """
+    if params is None:
+        params = {
+            'objective': 'regression',
+            'metric': 'mape',
+            'boosting_type': 'gbdt',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'random_state': RANDOM_STATE
+        }
+    
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train, y_train)
+    
+    return model
+
+def treinar_xgboost(X_train, y_train, params=None):
+    """
+    Treina modelo XGBoost
+    """
+    if params is None:
+        params = {
+            'objective': 'reg:squarederror',
+            'max_depth': 6,
+            'learning_rate': 0.05,
+            'n_estimators': 200,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'random_state': RANDOM_STATE,
+            'verbosity': 0
+        }
+    
+    model = xgb.XGBRegressor(**params)
+    model.fit(X_train, y_train)
+    
+    return model
+
+def treinar_elasticnet(X_train, y_train, usar_scaler=True, params=None):
+    """
+    Treina modelo ElasticNet com ou sem StandardScaler
+    """
+    if params is None:
+        params = {
+            'alpha': 1.0,
+            'l1_ratio': 0.5,
+            'random_state': RANDOM_STATE,
+            'max_iter': 2000
+        }
+    
+    if usar_scaler:
+        pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('model', ElasticNet(**params))
+        ])
+    else:
+        pipeline = Pipeline([
+            ('model', ElasticNet(**params))
+        ])
+    
+    pipeline.fit(X_train, y_train)
+    
+    return pipeline
+
+def treinar_sarimax(y_train, order=(1,1,1), seasonal_order=(1,1,1,12)):
+    """
+    Treina modelo SARIMAX
+    """
+    model = SARIMAX(
+        y_train,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    
+    fitted_model = model.fit(disp=False)
+    
+    return fitted_model
+
+# ============================================================================
+# 7. CROSS-VALIDATION COM TIME SERIES SPLIT
+# ============================================================================
+
+def cross_validate_model(X, y, model_name, params=None, usar_scaler=False, usar_log=False):
+    """
+    Realiza cross-validation com TimeSeriesSplit
+    """
+    tscv = TimeSeriesSplit(n_splits=N_FOLDS)
+    
+    fold_metrics = []
+    
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        # Treinar modelo
+        if model_name == 'lightgbm':
+            model = treinar_lightgbm(X_train, y_train, params)
+        elif model_name == 'xgboost':
+            model = treinar_xgboost(X_train, y_train, params)
+        elif model_name == 'elasticnet':
+            model = treinar_elasticnet(X_train, y_train, usar_scaler, params)
+        elif model_name == 'sarimax':
+            model = treinar_sarimax(y_train, params.get('order', (1,1,1)), 
+                                   params.get('seasonal_order', (1,1,1,12)))
+            y_pred = model.forecast(steps=len(y_val))
+            
+            # Reverter log se necessário
+            if usar_log:
+                y_pred = np.expm1(y_pred)
+                y_val_original = np.expm1(y_val)
+            else:
+                y_val_original = y_val
+            
+            metrics = calcular_metricas(y_val_original, y_pred)
+            fold_metrics.append(metrics)
+            continue
+        
+        # Predição
+        y_pred = model.predict(X_val)
+        
+        # Reverter log se necessário
+        if usar_log:
+            y_pred = np.expm1(y_pred)
+            y_val_original = np.expm1(y_val)
+        else:
+            y_val_original = y_val
+        
+        metrics = calcular_metricas(y_val_original, y_pred)
+        fold_metrics.append(metrics)
+    
+    # Média das métricas
+    avg_metrics = {
+        'MAPE': np.mean([m['MAPE'] for m in fold_metrics]),
+        'RMSE': np.mean([m['RMSE'] for m in fold_metrics]),
+        'MAE': np.mean([m['MAE'] for m in fold_metrics])
+    }
+    
+    return avg_metrics, fold_metrics
+
+# ============================================================================
+# 8. OTIMIZAÇÃO COM OPTUNA
+# ============================================================================
+
+def otimizar_lightgbm(X, y, n_trials=50):
+    """
+    Otimiza hiperparâmetros do LightGBM usando Optuna
+    """
+    best_mape = float('inf')
+    
+    def objective(trial):
+        nonlocal best_mape
+        params = {
+            'objective': 'regression',
+            'metric': 'mape',
+            'boosting_type': 'gbdt',
+            'num_leaves': trial.suggest_int('num_leaves', 20, 150),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
+            'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
+            'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+            'verbose': -1,
+            'random_state': RANDOM_STATE,
+            'n_estimators': 200
+        }
+        
+        metrics, _ = cross_validate_model(X, y, 'lightgbm', params)
+        mape = metrics['MAPE']
+        
+        if mape < best_mape:
+            best_mape = mape
+            print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}% ⭐ (melhor até agora)")
+        else:
+            if (trial.number + 1) % 5 == 0:  # Mostrar a cada 5 trials
+                print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}%")
+        
+        return mape
+    
+    study = optuna.create_study(direction='minimize', study_name='lightgbm_optimization')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    return study.best_params
+
+def otimizar_xgboost(X, y, n_trials=50):
+    """
+    Otimiza hiperparâmetros do XGBoost usando Optuna
+    """
+    best_mape = float('inf')
+    
+    def objective(trial):
+        nonlocal best_mape
+        params = {
+            'objective': 'reg:squarederror',
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'random_state': RANDOM_STATE,
+            'verbosity': 0
+        }
+        
+        metrics, _ = cross_validate_model(X, y, 'xgboost', params)
+        mape = metrics['MAPE']
+        
+        if mape < best_mape:
+            best_mape = mape
+            print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}% ⭐ (melhor até agora)")
+        else:
+            if (trial.number + 1) % 5 == 0:
+                print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}%")
+        
+        return mape
+    
+    study = optuna.create_study(direction='minimize', study_name='xgboost_optimization')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    return study.best_params
+
+def otimizar_elasticnet(X, y, usar_scaler=True, n_trials=50):
+    """
+    Otimiza hiperparâmetros do ElasticNet usando Optuna
+    """
+    best_mape = float('inf')
+    
+    def objective(trial):
+        nonlocal best_mape
+        params = {
+            'alpha': trial.suggest_float('alpha', 0.0001, 10.0, log=True),
+            'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),
+            'random_state': RANDOM_STATE,
+            'max_iter': 2000
+        }
+        
+        metrics, _ = cross_validate_model(X, y, 'elasticnet', params, usar_scaler)
+        mape = metrics['MAPE']
+        
+        if mape < best_mape:
+            best_mape = mape
+            print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}% ⭐ (melhor até agora)")
+        else:
+            if (trial.number + 1) % 5 == 0:
+                print(f"  Trial {trial.number + 1}/{n_trials}: MAPE = {mape:.4f}%")
+        
+        return mape
+    
+    study = optuna.create_study(direction='minimize', study_name='elasticnet_optimization')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    return study.best_params
+
+# ============================================================================
+# 9. PIPELINE COMPLETO DE MODELAGEM
+# ============================================================================
+
+def executar_pipeline_completo(df, target_col='VALOR_TOTAL', usar_log=False, n_trials_optuna=30):
+    """
+    Executa o pipeline completo de modelagem
+    """
+    print(f"\n{'='*80}")
+    print(f"PIPELINE: Target={target_col}, Log={usar_log}")
+    print(f"{'='*80}\n")
+    
+    # Preparar dados
+    df_prep = preparar_dados(df, target_col, usar_log)
+    X, y, feature_cols = separar_features_target(df_prep, target_col)
+    
+    print(f"Shape dos dados: X={X.shape}, y={y.shape}")
+    
+    # Feature Selection com Boruta
+    selected_features, boruta_selector = selecionar_features_boruta(X, y, max_iter=50)
+    X_selected = X[selected_features].copy()
+    
+    print(f"\nFeatures selecionadas ({len(selected_features)}):")
+    print(selected_features[:10], "...")
+    
+    # Dicionário para armazenar resultados
+    resultados = {}
+    
+    # ========================================================================
+    # LIGHTGBM
+    # ========================================================================
+    print("\n" + "="*80)
+    print("Otimizando LightGBM...")
+    print(f"Executando {n_trials_optuna} trials...")
+    print("="*80)
+    best_params_lgb = otimizar_lightgbm(X_selected, y, n_trials=n_trials_optuna)
+    print(f"✓ Melhores parâmetros LightGBM: {best_params_lgb}")
+    
+    metrics_lgb, _ = cross_validate_model(X_selected, y, 'lightgbm', best_params_lgb, usar_log=usar_log)
+    resultados['LightGBM'] = {
+        'metrics': metrics_lgb,
+        'params': best_params_lgb,
+        'features': selected_features
+    }
+    print(f"✓ LightGBM - MAPE: {metrics_lgb['MAPE']:.2f}%")
+    
+    # ========================================================================
+    # XGBOOST
+    # ========================================================================
+    print("\n" + "="*80)
+    print("Otimizando XGBoost...")
+    print(f"Executando {n_trials_optuna} trials...")
+    print("="*80)
+    best_params_xgb = otimizar_xgboost(X_selected, y, n_trials=n_trials_optuna)
+    print(f"✓ Melhores parâmetros XGBoost: {best_params_xgb}")
+    
+    metrics_xgb, _ = cross_validate_model(X_selected, y, 'xgboost', best_params_xgb, usar_log=usar_log)
+    resultados['XGBoost'] = {
+        'metrics': metrics_xgb,
+        'params': best_params_xgb,
+        'features': selected_features
+    }
+    print(f"✓ XGBoost - MAPE: {metrics_xgb['MAPE']:.2f}%")
+    
+    # ========================================================================
+    # ELASTICNET COM SCALER
+    # ========================================================================
+    print("\n" + "="*80)
+    print("Otimizando ElasticNet (com StandardScaler)...")
+    print(f"Executando {n_trials_optuna} trials...")
+    print("="*80)
+    best_params_en = otimizar_elasticnet(X_selected, y, usar_scaler=True, n_trials=n_trials_optuna)
+    print(f"✓ Melhores parâmetros ElasticNet: {best_params_en}")
+    
+    metrics_en, _ = cross_validate_model(X_selected, y, 'elasticnet', best_params_en, usar_scaler=True, usar_log=usar_log)
+    resultados['ElasticNet'] = {
+        'metrics': metrics_en,
+        'params': best_params_en,
+        'features': selected_features,
+        'usar_scaler': True
+    }
+    print(f"✓ ElasticNet - MAPE: {metrics_en['MAPE']:.2f}%")
+    
+    # ========================================================================
+    # SARIMAX (sem otimização extensiva devido ao tempo)
+    # ========================================================================
+    print("\n" + "="*80)
+    print("Treinando SARIMAX...")
+    print("="*80)
+    sarimax_params = {
+        'order': (1, 1, 1),
+        'seasonal_order': (1, 1, 1, 12)
+    }
+    
+    try:
+        metrics_sarimax, _ = cross_validate_model(X_selected, y, 'sarimax', sarimax_params, usar_log=usar_log)
+        resultados['SARIMAX'] = {
+            'metrics': metrics_sarimax,
+            'params': sarimax_params,
+            'features': []
+        }
+        print(f"✓ SARIMAX - MAPE: {metrics_sarimax['MAPE']:.2f}%")
+    except Exception as e:
+        print(f"⚠ Erro ao treinar SARIMAX: {e}")
+        resultados['SARIMAX'] = None
+    
+    return resultados, df_prep, X_selected, y, selected_features
+
+# ============================================================================
+# 10. SELEÇÃO DO MELHOR MODELO
+# ============================================================================
+
+def selecionar_melhor_modelo(resultados):
+    """
+    Seleciona o modelo com menor MAPE
+    """
+    melhor_modelo = None
+    melhor_mape = float('inf')
+    
+    for nome, resultado in resultados.items():
+        if resultado is not None:
+            mape = resultado['metrics']['MAPE']
+            if mape < melhor_mape:
+                melhor_mape = mape
+                melhor_modelo = nome
+    
+    return melhor_modelo, melhor_mape
+
+# ============================================================================
+# 11. TREINAMENTO FINAL E FORECAST
+# ============================================================================
+
+def treinar_modelo_final(X, y, modelo_nome, params, usar_scaler=False):
+    """
+    Treina o modelo final com todos os dados
+    """
+    if modelo_nome == 'LightGBM':
+        model = treinar_lightgbm(X, y, params)
+    elif modelo_nome == 'XGBoost':
+        model = treinar_xgboost(X, y, params)
+    elif modelo_nome == 'ElasticNet':
+        model = treinar_elasticnet(X, y, usar_scaler, params)
+    elif modelo_nome == 'SARIMAX':
+        model = treinar_sarimax(y, params.get('order', (1,1,1)), 
+                               params.get('seasonal_order', (1,1,1,12)))
+    
+    return model
+
+def gerar_forecast(model, df_historico, modelo_nome, features_usadas, target_col='VALOR_TOTAL', n_periods=12, usar_log=False):
+    """
+    Gera forecast para os próximos períodos com reconstrução correta de features
+    """
+    forecast_dates = pd.date_range(
+        start=df_historico['DATA'].max() + pd.DateOffset(months=1),
+        periods=n_periods,
+        freq='MS'
+    )
+    
+    if modelo_nome == 'SARIMAX':
+        # SARIMAX tem método próprio de forecast
+        forecast_values = model.forecast(steps=n_periods)
+        if usar_log:
+            forecast_values = np.expm1(forecast_values)
+    else:
+        # Para modelos ML, precisamos fazer forecast iterativo
+        forecast_list = []
+        
+        # Começar com dados históricos completos (SEM transformação log)
+        df_extended = df_historico.copy()
+        
+        for i in range(n_periods):
+            next_date = forecast_dates[i]
+            
+            # Variáveis macro futuras (em produção, usar previsões reais da área de economia)
+            next_selic = df_extended['SELIC'].iloc[-3:].mean()
+            next_ipca = df_extended['IPCA'].iloc[-3:].mean()
+            next_cambio = df_extended['CAMBIO'].iloc[-3:].mean()
+            next_pib = df_extended['PIB'].iloc[-3:].mean()
+            
+            # Criar nova linha com valor placeholder
+            new_row = pd.DataFrame([{
+                'DATA': next_date,
+                'VALOR_TOTAL': df_extended['VALOR_TOTAL'].iloc[-1],
+                'SELIC': next_selic,
+                'IPCA': next_ipca,
+                'CAMBIO': next_cambio,
+                'PIB': next_pib
+            }])
+            
+            df_extended = pd.concat([df_extended, new_row], ignore_index=True)
+            
+            # Criar features temporais
+            df_extended = criar_features_temporais(df_extended)
+            
+            # IMPORTANTE: Criar lags e features SEM log primeiro
+            df_extended_features = criar_lags_e_features(df_extended, 'VALOR_TOTAL', n_lags=6)
+            df_extended_features = criar_incremento_mensal(df_extended_features, 'VALOR_TOTAL')
+            
+            # Agora pegar a última linha
+            ultima_linha = df_extended_features.iloc[[-1]].copy()
+            
+            # Se o modelo foi treinado com log, aplicar log APENAS nas features necessárias
+            if usar_log:
+                # Aplicar log apenas nas colunas que começam com VALOR_TOTAL (exceto ORIGINAL)
+                for col in ultima_linha.columns:
+                    if 'VALOR_TOTAL' in col and 'ORIGINAL' not in col and col != 'VALOR_TOTAL':
+                        if not ultima_linha[col].isna().all() and (ultima_linha[col] > 0).all():
+                            ultima_linha[col] = np.log1p(ultima_linha[col])
+            
+            # Verificar quais features existem
+            features_disponiveis = [f for f in features_usadas if f in ultima_linha.columns]
+            
+            # Preencher valores faltantes
+            X_future = ultima_linha[features_disponiveis].ffill().bfill().fillna(0)
+            
+            # Fazer predição
+            try:
+                pred = model.predict(X_future)[0]
+            except Exception as e:
+                print(f"Erro na predição: {e}")
+                # Se falhar, usar último valor conhecido
+                pred = df_extended['VALOR_TOTAL'].iloc[-2]
+            
+            # Se modelo foi treinado com log, pred está em escala log
+            if usar_log:
+                pred = np.expm1(pred)
+            
+            # Garantir valor positivo e razoável
+            pred = max(pred, 0)
+            
+            # Limitar crescimento absurdo (máximo 20% ao mês)
+            ultimo_valor_real = df_extended['VALOR_TOTAL'].iloc[-2]
+            max_crescimento = ultimo_valor_real * 1.20
+            min_decrescimento = ultimo_valor_real * 0.80
+            
+            pred = np.clip(pred, min_decrescimento, max_crescimento)
+            
+            forecast_list.append(pred)
+            
+            # Atualizar o valor no dataframe para próxima iteração
+            df_extended.loc[df_extended.index[-1], 'VALOR_TOTAL'] = pred
+        
+        forecast_values = np.array(forecast_list)
+    
+    forecast_df = pd.DataFrame({
+        'DATA': forecast_dates,
+        'FORECAST': forecast_values
+    })
+    
+    return forecast_df
+
+# ============================================================================
+# 12. VISUALIZAÇÃO
+# ============================================================================
+
+def plotar_resultados(df_historico, forecast_df, modelo_nome, target_col='VALOR_TOTAL'):
+    """
+    Plota resultados históricos e forecast
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
+    
+    # Gráfico 1: Histórico Real
+    ax1.plot(df_historico['DATA'], df_historico[target_col], 
+             label='Valores Históricos', linewidth=2, color='#2E86AB')
+    ax1.set_title(f'Histórico - {target_col}', fontsize=16, fontweight='bold')
+    ax1.set_xlabel('Data', fontsize=12)
+    ax1.set_ylabel('Valor (R$)', fontsize=12)
+    ax1.legend(fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    ax1.tick_params(axis='x', rotation=45)
+    
+    # Formatar eixo Y
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.1f}M'))
+    
+    # Gráfico 2: Forecast
+    ax2.plot(df_historico['DATA'].tail(24), df_historico[target_col].tail(24), 
+             label='Últimos 24 meses (Real)', linewidth=2, color='#2E86AB')
+    ax2.plot(forecast_df['DATA'], forecast_df['FORECAST'], 
+             label=f'Forecast 12 meses ({modelo_nome})', linewidth=2, 
+             color='#A23B72', linestyle='--', marker='o', markersize=6)
+    ax2.axvline(x=df_historico['DATA'].max(), color='red', linestyle=':', 
+                linewidth=2, label='Início Forecast')
+    ax2.set_title(f'Forecast 12 Meses - Modelo: {modelo_nome}', fontsize=16, fontweight='bold')
+    ax2.set_xlabel('Data', fontsize=12)
+    ax2.set_ylabel('Valor (R$)', fontsize=12)
+    ax2.legend(fontsize=11)
+    ax2.grid(True, alpha=0.3)
+    ax2.tick_params(axis='x', rotation=45)
+    
+    # Formatar eixo Y
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.1f}M'))
+    
+    plt.tight_layout()
+    plt.show()
+    
+def exibir_tabela_forecast(forecast_df, df_historico):
+    """
+    Exibe tabela formatada com o forecast
+    """
+    print("\n" + "="*80)
+    print("FORECAST - Próximos 12 Meses")
+    print("="*80)
+    
+    # Último valor real
+    ultimo_valor = df_historico['VALOR_TOTAL'].iloc[-1]
+    
+    # Verificar se há valores absurdos (explosão do modelo)
+    if forecast_df['FORECAST'].max() > ultimo_valor * 10:
+        print("\n⚠️  ALERTA: Valores de forecast parecem anormalmente altos!")
+        print("    Possível problema no modelo ou nas transformações.")
+        print("    Recomenda-se revisar o pipeline de forecast.\n")
+    
+    print(f"\n{'Mês':<15} {'Forecast (R$)':>20} {'Variação MoM':>15} {'Var % Acum':>15}")
+    print("-" * 80)
+    
+    for idx, row in forecast_df.iterrows():
+        mes = row['DATA'].strftime('%b/%Y')
+        valor = row['FORECAST']
+        
+        if idx == 0:
+            var_mom = ((valor - ultimo_valor) / ultimo_valor) * 100
+        else:
+            var_mom = ((valor - forecast_df.iloc[idx-1]['FORECAST']) / forecast_df.iloc[idx-1]['FORECAST']) * 100
+        
+        var_acum = ((valor - ultimo_valor) / ultimo_valor) * 100
+        
+        print(f"{mes:<15} {valor:>20,.0f} {var_mom:>14,.2f}% {var_acum:>14,.2f}%")
+    
+    print("-" * 80)
+    print(f"Valor Inicial (Nov/2025): {ultimo_valor:>20,.0f}")
+    print(f"Valor Final (Out/2026):   {forecast_df['FORECAST'].iloc[-1]:>20,.0f}")
+    print(f"Crescimento Total:        {((forecast_df['FORECAST'].iloc[-1] - ultimo_valor) / ultimo_valor * 100):>19,.2f}%")
+    print("="*80 + "\n")
+
+def plotar_comparacao_modelos(resultados):
+    """
+    Plota comparação de performance dos modelos
+    """
+    modelos = []
+    mapes = []
+    
+    for nome, resultado in resultados.items():
+        if resultado is not None:
+            modelos.append(nome)
+            mapes.append(resultado['metrics']['MAPE'])
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
+    bars = ax.bar(modelos, mapes, color=colors[:len(modelos)])
+    
+    ax.set_title('Comparação de Modelos - MAPE (%)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('MAPE (%)', fontsize=12)
+    ax.set_xlabel('Modelo', fontsize=12)
+    
+    # Adicionar valores nas barras
+    for bar, mape in zip(bars, mapes):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{mape:.2f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================================
+# 13. FUNÇÃO PRINCIPAL
+# ============================================================================
+
+def main():
+    """
+    Função principal que orquestra todo o processo
+    """
+    print("\n" + "="*80)
+    print("SISTEMA DE FORECASTING - CARTEIRA DE POUPANÇA")
+    print("="*80 + "\n")
+    
+    # Gerar dados sintéticos (em produção, usar df real)
+    print("Gerando dados sintéticos...")
+    df = gerar_dados_sinteticos()
+    print(f"Dados gerados: {len(df)} observações")
+    print(f"Período: {df['DATA'].min()} até {df['DATA'].max()}\n")
+    
+    # ========================================================================
+    # ABORDAGEM 1: PREVER VALOR_TOTAL DIRETAMENTE
+    # ========================================================================
+    print("\n" + "="*80)
+    print("ABORDAGEM 1: PREVER VALOR_TOTAL DIRETAMENTE")
+    print("="*80)
+    
+    # Testar com e sem log
+    resultados_sem_log, df_prep1, X1, y1, features1 = executar_pipeline_completo(
+        df, target_col='VALOR_TOTAL', usar_log=False, n_trials_optuna=20
+    )
+    
+    resultados_com_log, df_prep2, X2, y2, features2 = executar_pipeline_completo(
+        df, target_col='VALOR_TOTAL', usar_log=True, n_trials_optuna=20
+    )
+    
+    # Selecionar melhor configuração
+    melhor_config1 = 'sem_log' if resultados_sem_log['LightGBM']['metrics']['MAPE'] < \
+                                   resultados_com_log['LightGBM']['metrics']['MAPE'] else 'com_log'
+    resultados1 = resultados_sem_log if melhor_config1 == 'sem_log' else resultados_com_log
+    usar_log1 = melhor_config1 == 'com_log'
+    
+    print(f"\nMelhor configuração Abordagem 1: {melhor_config1}")
+    
+    # ========================================================================
+    # ABORDAGEM 2: PREVER INCREMENTO MENSAL
+    # ========================================================================
+    print("\n" + "="*80)
+    print("ABORDAGEM 2: PREVER INCREMENTO MENSAL")
+    print("="*80)
+    
+    resultados_inc, df_prep_inc, X_inc, y_inc, features_inc = executar_pipeline_completo(
+        df, target_col='INCREMENTO', usar_log=False, n_trials_optuna=20
+    )
+    
+    # ========================================================================
+    # COMPARAÇÃO FINAL E SELEÇÃO DO MODELO VENCEDOR
+    # ========================================================================
+    print("\n" + "="*80)
+    print("COMPARAÇÃO FINAL DE RESULTADOS")
+    print("="*80 + "\n")
+    
+    print("ABORDAGEM 1 - VALOR_TOTAL:")
+    plotar_comparacao_modelos(resultados1)
+    melhor_modelo1, melhor_mape1 = selecionar_melhor_modelo(resultados1)
+    print(f"Melhor modelo: {melhor_modelo1} com MAPE = {melhor_mape1:.2f}%\n")
+    
+    print("ABORDAGEM 2 - INCREMENTO:")
+    plotar_comparacao_modelos(resultados_inc)
+    melhor_modelo2, melhor_mape2 = selecionar_melhor_modelo(resultados_inc)
+    print(f"Melhor modelo: {melhor_modelo2} com MAPE = {melhor_mape2:.2f}%\n")
+    
+    # Escolher abordagem vencedora
+    if melhor_mape1 < melhor_mape2:
+        print(f"\n🏆 MODELO VENCEDOR: {melhor_modelo1} (Abordagem 1 - VALOR_TOTAL)")
+        print(f"MAPE: {melhor_mape1:.2f}%\n")
+        modelo_final_nome = melhor_modelo1
+        modelo_final_params = resultados1[melhor_modelo1]['params']
+        modelo_final_features = resultados1[melhor_modelo1]['features']
+        usar_scaler_final = resultados1[melhor_modelo1].get('usar_scaler', False)
+        df_prep_final = df_prep1 if melhor_config1 == 'sem_log' else df_prep2
+        X_final = X1 if melhor_config1 == 'sem_log' else X2
+        y_final = y1 if melhor_config1 == 'sem_log' else y2
+        target_final = 'VALOR_TOTAL'
+        usar_log_final = usar_log1
+    else:
+        print(f"\n🏆 MODELO VENCEDOR: {melhor_modelo2} (Abordagem 2 - INCREMENTO)")
+        print(f"MAPE: {melhor_mape2:.2f}%\n")
+        modelo_final_nome = melhor_modelo2
+        modelo_final_params = resultados_inc[melhor_modelo2]['params']
+        modelo_final_features = resultados_inc[melhor_modelo2]['features']
+        usar_scaler_final = resultados_inc[melhor_modelo2].get('usar_scaler', False)
+        df_prep_final = df_prep_inc
+        X_final = X_inc
+        y_final = y_inc
+        target_final = 'INCREMENTO'
+        usar_log_final = False
+    
+    # ========================================================================
+    # TREINAMENTO FINAL E FORECAST
+    # ========================================================================
+    print("="*80)
+    print("TREINAMENTO DO MODELO FINAL E GERAÇÃO DO FORECAST")
+    print("="*80 + "\n")
+    
+    # Treinar modelo final
+    X_final_selected = X_final[modelo_final_features]
+    modelo_final = treinar_modelo_final(
+        X_final_selected, y_final, modelo_final_nome, 
+        modelo_final_params, usar_scaler_final
+    )
+    
+    print(f"Modelo final treinado: {modelo_final_nome}")
+    print(f"Features utilizadas: {len(modelo_final_features)}\n")
+    
+    # Gerar forecast
+    print("Gerando forecast para 12 meses...")
+    print(f"Modelo: {modelo_final_nome}, Target: {target_final}, Usar Log: {usar_log_final}")
+    print(f"Último valor histórico: {df['VALOR_TOTAL'].iloc[-1]:,.0f}")
+    
+    forecast_df = gerar_forecast(
+        modelo_final, df, modelo_final_nome, 
+        modelo_final_features, target_final,
+        n_periods=FORECAST_HORIZON, usar_log=usar_log_final
+    )
+    
+    print(f"\n✓ Forecast gerado com sucesso!")
+    print(f"Primeiro valor forecast: {forecast_df['FORECAST'].iloc[0]:,.0f}")
+    print(f"Último valor forecast: {forecast_df['FORECAST'].iloc[-1]:,.0f}")
+    
+    # Exibir tabela do forecast
+    exibir_tabela_forecast(forecast_df, df)
+    
+    # ========================================================================
+    # VISUALIZAÇÕES FINAIS
+    # ========================================================================
+    print("\n" + "="*80)
+    print("GERANDO VISUALIZAÇÕES")
+    print("="*80 + "\n")
+    
+    plotar_resultados(df, forecast_df, modelo_final_nome, target_final)
+    
+    print("\n" + "="*80)
+    print("PROCESSO FINALIZADO COM SUCESSO!")
+    print("="*80 + "\n")
+    
+    return {
+        'modelo_final': modelo_final,
+        'modelo_nome': modelo_final_nome,
+        'forecast': forecast_df,
+        'resultados_abordagem1': resultados1,
+        'resultados_abordagem2': resultados_inc,
+        'features_selecionadas': modelo_final_features,
+        'df_historico': df
+    }
+
+# ============================================================================
+# EXECUÇÃO
+# ============================================================================
+
+if __name__ == "__main__":
+    # Suprimir warnings do Optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    
+    # Executar pipeline completo
+    resultado_final = main()
+    
+    print("\n✅ Sistema pronto para produção!")
+    print("📊 Use 'resultado_final' para acessar modelo e previsões")
